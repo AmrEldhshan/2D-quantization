@@ -220,6 +220,9 @@ class PredictiveCoding2D:
         """Decompress using predicted and dequantized images"""
         predicted = self.load_image(predicted_path)
         dequantized = self.load_image(dequantized_path)
+
+        # The dequantized image is the actual error values (not offset)
+        # So we can directly add them
         decompressed = predicted + dequantized
 
         folder = "output"
@@ -481,6 +484,10 @@ class PredictiveCodingGUI:
             self.progress['value'] = 0
             self.progress_label.config(text="")
 
+            # Update progress during compression
+            self.update_progress(10, "Starting compression...")
+            self.root.update()
+
             # Start compression
             self.pc.compress(image_path)
 
@@ -509,8 +516,15 @@ class PredictiveCodingGUI:
             self.decompress_progress['value'] = 0
             self.decompress_label.config(text="")
 
+            # Update progress during decompression
+            self.update_decompress_progress(10, "Loading images...")
+            self.root.update()
+
+            self.update_decompress_progress(50, "Decompressing...")
+            self.root.update()
+
             # Start decompression
-            self.pc.decompress(predicted_path, dequantized_path, "decompressed_only")
+            self.pc.decompress(predicted_path, dequantized_path, "decompressed_only.png")
 
             self.decompress_progress['value'] = 100
             self.decompress_label.config(text="Decompression complete!")
@@ -524,7 +538,10 @@ class PredictiveCodingGUI:
     def open_output_folder(self):
         output_folder = "output"
         if os.path.exists(output_folder):
-            os.startfile(output_folder) if os.name == 'nt' else os.system(f'open "{output_folder}"')
+            if os.name == 'nt':
+                os.startfile(output_folder)
+            else:
+                os.system(f'open "{output_folder}"')
         else:
             messagebox.showinfo("Info", "Output folder doesn't exist yet. Run compression first.")
 
