@@ -11,7 +11,7 @@ from PIL import Image, ImageTk
 
 
 # ============================================================================
-# PredictiveCoding2D Class (COMPLETE AND UNMODIFIED from your code)
+# PredictiveCoding2D Class - Core Compression Logic
 # ============================================================================
 class PredictiveCoding2D:
     def __init__(self, num_bits=2, use_color=True):
@@ -25,6 +25,7 @@ class PredictiveCoding2D:
 
         # Store quantizer settings for the binary header
         self.quantizers_info = []
+        self.quantizer_tables = []  # Store the actual quantizer tables
 
         # Image Buffers
         self.original = None
@@ -36,7 +37,7 @@ class PredictiveCoding2D:
 
     def adaptive_predictor(self, A, B, C):
         """
-        [cite_start]Adaptive 2D Predictor Logic from Lecture Slide 13 [cite: 109, 110]
+        Adaptive 2D Predictor Logic
         """
         min_AC = min(A, C)
         max_AC = max(A, C)
@@ -50,7 +51,7 @@ class PredictiveCoding2D:
 
     def create_uniform_quantizer(self, min_val, max_val):
         """
-        [cite_start]Creates a dynamic uniform quantizer based on error range [cite: 47]
+        Creates a dynamic uniform quantizer based on error range
         """
         quantizer = []
         # Avoid division by zero
@@ -119,6 +120,7 @@ class PredictiveCoding2D:
         self.dequantized = np.zeros_like(self.original)
         self.decompressed = np.zeros_like(self.original)
         self.quantizers_info = [] # Reset
+        self.quantizer_tables = [] # Reset
 
         # --- 2. Process Each Channel Separately ---
         for c in range(channels):
@@ -126,9 +128,7 @@ class PredictiveCoding2D:
             channel_orig = self.original[:, :, c]
 
             # --- PASS 1: Range Estimation ---
-            # We calculate approximate errors using original pixels to find Min/Max
             temp_errors = []
-            # Subsampling (step=4) speeds up estimation without losing much accuracy
             for y in range(0, height, 4):
                 for x in range(0, width, 4):
                     if x==0 and y==0: p=128.0
@@ -142,9 +142,9 @@ class PredictiveCoding2D:
             # Create Quantizer Table for this channel
             q_table = self.create_uniform_quantizer(min_e, max_e)
             self.quantizers_info.append({'min': min_e, 'max': max_e})
+            self.quantizer_tables.append(q_table)  # Store the table
 
             # --- PASS 2: Feedback Loop (Real Compression) ---
-            # [cite_start]We must predict based on the RECONSTRUCTED (Decompressed) image [cite: 57]
             channel_recon = np.zeros((height, width))
 
             for y in range(height):
@@ -154,7 +154,6 @@ class PredictiveCoding2D:
                     elif x==0: pred = channel_recon[y-1, x]
                     elif y==0: pred = channel_recon[y, x-1]
                     else:
-                        # Use Reconstructed neighbors (Feedback)
                         pred = self.adaptive_predictor(channel_recon[y, x-1], channel_recon[y-1, x], channel_recon[y-1, x-1])
 
                     self.predicted[y, x, c] = pred
@@ -185,7 +184,6 @@ class PredictiveCoding2D:
     def save_binary_file(self, output_path="output/compressed_data.bin"):
         """
         Saves the '4_Quantized' data as a PACKED BINARY FILE.
-        This solves the file size issue.
         """
         if self.quantized is None:
             return
@@ -200,36 +198,29 @@ class PredictiveCoding2D:
 
         with open(output_path, 'wb') as f:
             # --- HEADER ---
-            # 1. Signature 'PC2D'
             f.write(b'PC2D')
-            # 2. Metadata: Width(2B), Height(2B), Channels(1B), BitsPerPixel(1B)
             f.write(struct.pack('>HHBB', w, h, c, self.num_bits))
 
-            # 3. Quantizer Ranges (Min/Max for each channel)
-            # This is needed so a decoder knows what "Level 0" or "Level 3" actually means
+            # Quantizer Ranges
             for q_info in self.quantizers_info:
                 f.write(struct.pack('>ff', q_info['min'], q_info['max']))
 
             # --- DATA BODY ---
-            # Flatten the array of indices [0, 3, 1, 2, 0, ...]
             flat_indices = self.quantized.flatten().astype(int)
 
             bit_buffer = 0
             bits_in_buffer = 0
             byte_array = bytearray()
 
-            # Pack bits (e.g., four 2-bit pixels into one 8-bit byte)
             for level in flat_indices:
                 bit_buffer = (bit_buffer << self.num_bits) | level
                 bits_in_buffer += self.num_bits
 
                 while bits_in_buffer >= 8:
-                    # Extract the top 8 bits
                     byte_val = (bit_buffer >> (bits_in_buffer - 8)) & 0xFF
                     byte_array.append(byte_val)
                     bits_in_buffer -= 8
 
-            # Handle remaining bits (padding)
             if bits_in_buffer > 0:
                 byte_val = (bit_buffer << (8 - bits_in_buffer)) & 0xFF
                 byte_array.append(byte_val)
@@ -238,7 +229,7 @@ class PredictiveCoding2D:
 
         # Calculate compression stats
         bin_size = os.path.getsize(output_path)
-        raw_size = h * w * c  # 1 byte per pixel (8-bit)
+        raw_size = h * w * c
         print(f"  Binary File Size: {bin_size/1024:.2f} KB")
         print(f"  Original Raw Size: {raw_size/1024:.2f} KB")
         print(f"  Compression Ratio: {raw_size/bin_size:.2f}:1")
@@ -249,14 +240,12 @@ class PredictiveCoding2D:
 
         def save_vis(img, name):
             if img is None: return
-            # Normalize min-max to 0-255 for visualization
             _min, _max = img.min(), img.max()
             if _max > _min:
                 vis = ((img - _min) / (_max - _min) * 255).astype(np.uint8)
             else:
                 vis = img.astype(np.uint8)
 
-            # Convert to BGR if color
             if len(vis.shape) == 3:
                 vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
 
@@ -264,18 +253,172 @@ class PredictiveCoding2D:
 
         print(f"\n[Visuals] Saving PNGs to '{output_dir}'...")
 
-        # 1. Original
         save_vis(self.original, "1_original.png")
-        # 2. Predicted
         save_vis(self.predicted, "2_predicted.png")
-        # 3. Error
         save_vis(self.error, "3_error.png")
-        # 4. Quantized (Visual Map)
         save_vis(self.quantized, "4_quantized.png")
-        # 5. De-quantized
         save_vis(self.dequantized, "5_dequantized.png")
-        # 6. Decompressed (Reconstructed)
         save_vis(self.decompressed, "6_decompressed.png")
+
+
+# ============================================================================
+# Decompressor Class - Separate Decompression Logic
+# ============================================================================
+class PredictiveCodingDecompressor:
+    def __init__(self):
+        self.decompressed = None
+        self.quantized = None
+        self.width = 0
+        self.height = 0
+        self.channels = 0
+        self.num_bits = 0
+        self.quantizers_info = []
+        self.quantizer_tables = []
+
+    def adaptive_predictor(self, A, B, C):
+        """Same adaptive predictor as compression"""
+        min_AC = min(A, C)
+        max_AC = max(A, C)
+
+        if B <= min_AC:
+            return max_AC
+        elif B >= max_AC:
+            return min_AC
+        else:
+            return A + C - B
+
+    def decompress(self, binary_file):
+        """Decompress a binary file"""
+        print("\n" + "="*60)
+        print(f"Starting Decompression...")
+
+        try:
+            # Read binary file
+            with open(binary_file, 'rb') as f:
+                # Read signature
+                signature = f.read(4)
+                if signature != b'PC2D':
+                    raise ValueError("Invalid binary file format")
+
+                # Read metadata
+                self.width, self.height, self.channels, self.num_bits = struct.unpack('>HHBB', f.read(6))
+                print(f"Image: {self.width}x{self.height}, {self.channels} channel(s), {self.num_bits} bits")
+
+                # Read quantizer ranges
+                self.quantizers_info = []
+                for _ in range(self.channels):
+                    min_val, max_val = struct.unpack('>ff', f.read(8))
+                    self.quantizers_info.append({'min': min_val, 'max': max_val})
+
+                # Read compressed data
+                compressed_data = f.read()
+
+            # Calculate total pixels
+            total_pixels = self.width * self.height * self.channels
+
+            # Unpack bits
+            num_levels = 2 ** self.num_bits
+            indices = []
+
+            bit_buffer = 0
+            bits_in_buffer = 0
+            byte_index = 0
+
+            for _ in range(total_pixels):
+                while bits_in_buffer < self.num_bits:
+                    if byte_index >= len(compressed_data):
+                        break
+                    bit_buffer = (bit_buffer << 8) | compressed_data[byte_index]
+                    byte_index += 1
+                    bits_in_buffer += 8
+
+                shift = bits_in_buffer - self.num_bits
+                level = (bit_buffer >> shift) & ((1 << self.num_bits) - 1)
+                indices.append(level)
+
+                bit_buffer &= (1 << shift) - 1
+                bits_in_buffer -= self.num_bits
+
+            # Reshape indices
+            self.quantized = np.array(indices, dtype=int).reshape(self.height, self.width, self.channels)
+
+            # Create quantizer tables
+            self.quantizer_tables = []
+            for q_info in self.quantizers_info:
+                min_val = q_info['min']
+                max_val = q_info['max']
+                step = (max_val - min_val) / num_levels
+                quantizer = []
+                for i in range(num_levels):
+                    lower = min_val + i * step
+                    upper = min_val + (i + 1) * step
+                    dequant = (lower + upper) / 2.0
+                    quantizer.append({
+                        'level': i,
+                        'lower': lower,
+                        'upper': upper,
+                        'dequant': dequant
+                    })
+                self.quantizer_tables.append(quantizer)
+
+            # Reconstruct image
+            self.decompressed = np.zeros((self.height, self.width, self.channels), dtype=float)
+
+            for c in range(self.channels):
+                channel_recon = np.zeros((self.height, self.width))
+                quantizer = self.quantizer_tables[c]
+
+                for y in range(self.height):
+                    for x in range(self.width):
+                        # Predict
+                        if x == 0 and y == 0:
+                            pred = 128.0
+                        elif x == 0:
+                            pred = channel_recon[y-1, x]
+                        elif y == 0:
+                            pred = channel_recon[y, x-1]
+                        else:
+                            A = channel_recon[y, x-1]
+                            B = channel_recon[y-1, x]
+                            C = channel_recon[y-1, x-1]
+                            pred = self.adaptive_predictor(A, B, C)
+
+                        # Get quantized error
+                        level = self.quantized[y, x, c]
+                        deq_err = quantizer[level]['dequant']
+
+                        # Reconstruct
+                        recon_val = np.clip(pred + deq_err, 0, 255)
+                        channel_recon[y, x] = recon_val
+                        self.decompressed[y, x, c] = recon_val
+
+            # If grayscale, remove channel dimension
+            if self.channels == 1:
+                self.decompressed = self.decompressed.squeeze()
+                self.quantized = self.quantized.squeeze()
+
+            print("Decompression Complete.")
+            return True
+
+        except Exception as e:
+            print(f"Decompression failed: {e}")
+            return False
+
+    def save_image(self, output_path):
+        """Save the decompressed image"""
+        if self.decompressed is None:
+            return False
+
+        # Convert to uint8
+        decompressed_uint8 = np.clip(self.decompressed, 0, 255).astype(np.uint8)
+
+        # Convert RGB to BGR for OpenCV if color
+        if len(decompressed_uint8.shape) == 3 and decompressed_uint8.shape[2] == 3:
+            decompressed_uint8 = cv2.cvtColor(decompressed_uint8, cv2.COLOR_RGB2BGR)
+
+        cv2.imwrite(output_path, decompressed_uint8)
+        print(f"Decompressed image saved to: {output_path}")
+        return True
 
 
 # ============================================================================
@@ -287,7 +430,7 @@ class ImageCompressionGUI:
         self.root.title("Image Compression System")
         self.root.geometry("1200x800")
 
-        # Initialize compressor
+        # Initialize compressor and decompressor
         self.compressor = None
         self.decompressor = None
 
@@ -309,11 +452,9 @@ class ImageCompressionGUI:
 
     def setup_gui(self):
         """Setup the main GUI layout"""
-        # Create main container
         main_container = ttk.Frame(self.root, padding="10")
         main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_container.columnconfigure(0, weight=1)
@@ -370,12 +511,10 @@ class ImageCompressionGUI:
                                                      font=('Courier', 9))
         self.console_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Configure weights for console area
         main_container.rowconfigure(4, weight=1)
 
     def setup_compress_tab(self):
         """Setup compression tab"""
-        # Input frame
         input_frame = ttk.LabelFrame(self.compress_tab, text="Compression Input", padding="10")
         input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
         input_frame.columnconfigure(1, weight=1)
@@ -417,14 +556,12 @@ class ImageCompressionGUI:
                                       command=self.start_compression_thread)
         self.compress_btn.grid(row=4, column=0, columnspan=3, pady=(20, 0))
 
-        # Configure weights
         self.compress_tab.columnconfigure(0, weight=1)
         self.compress_tab.rowconfigure(0, weight=1)
         input_frame.columnconfigure(1, weight=1)
 
     def setup_decompress_tab(self):
         """Setup decompression tab"""
-        # Input frame
         input_frame = ttk.LabelFrame(self.decompress_tab, text="Decompression Input", padding="10")
         input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
         input_frame.columnconfigure(1, weight=1)
@@ -453,18 +590,15 @@ class ImageCompressionGUI:
                                         command=self.start_decompression_thread)
         self.decompress_btn.grid(row=2, column=0, columnspan=3, pady=(20, 0))
 
-        # Configure weights
         self.decompress_tab.columnconfigure(0, weight=1)
         self.decompress_tab.rowconfigure(0, weight=1)
         input_frame.columnconfigure(1, weight=1)
 
     def setup_images_tab(self):
         """Setup images display tab"""
-        # Create a canvas with scrollbar for images
         canvas_frame = ttk.Frame(self.images_tab)
         canvas_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Configure grid weights
         self.images_tab.columnconfigure(0, weight=1)
         self.images_tab.rowconfigure(0, weight=1)
         canvas_frame.columnconfigure(0, weight=1)
@@ -505,11 +639,9 @@ class ImageCompressionGUI:
             label.grid(row=0, column=0, padx=5, pady=5)
             self.image_labels.append(label)
 
-            # Configure frame weights
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(0, weight=1)
 
-        # Configure scrollable frame grid
         for i in range(2):
             self.scrollable_frame.columnconfigure(i, weight=1)
         for i in range(3):
@@ -517,11 +649,9 @@ class ImageCompressionGUI:
 
     def setup_results_tab(self):
         """Setup results tab"""
-        # Create text widget for results
         text_frame = ttk.Frame(self.results_tab)
         text_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
 
-        # Configure grid weights
         self.results_tab.columnconfigure(0, weight=1)
         self.results_tab.rowconfigure(0, weight=1)
         text_frame.columnconfigure(0, weight=1)
@@ -623,11 +753,11 @@ class ImageCompressionGUI:
 
             # Create compressor instance
             use_color = (color_mode == "Color")
-            compressor = PredictiveCoding2D(num_bits=num_bits, use_color=use_color)
+            self.compressor = PredictiveCoding2D(num_bits=num_bits, use_color=use_color)
 
             # Run compression
             self.update_progress("Running compression algorithm...", 30)
-            success = compressor.compress(image_path)
+            success = self.compressor.compress(image_path)
 
             if not success:
                 raise Exception("Compression failed")
@@ -636,37 +766,28 @@ class ImageCompressionGUI:
             self.update_progress("Saving compressed binary file...", 70)
             base_name = os.path.splitext(os.path.basename(image_path))[0]
             binary_file = os.path.join(output_folder, f"{base_name}_compressed.bin")
-            compressor.save_binary_file(binary_file)
+            self.compressor.save_binary_file(binary_file)
 
             # Save images
             self.update_progress("Saving visual images...", 90)
-            compressor.save_images(output_folder)
+            self.compressor.save_images(output_folder)
+
+            # Complete
+            self.update_progress("Compression completed!", 100)
 
             # Calculate compression stats
-            original_size = os.path.getsize(image_path) * 8  # Convert bytes to bits
+            original_size = os.path.getsize(image_path) * 8
             compressed_size = os.path.getsize(binary_file) * 8
 
             # Get image data for display
             images = {
-                'original': compressor.original,
-                'predicted': compressor.predicted,
-                'error': compressor.error,
-                'quantized': compressor.quantized,
-                'dequantized': compressor.dequantized,
-                'decompressed': compressor.decompressed
+                'original': self.compressor.original,
+                'predicted': self.compressor.predicted,
+                'error': self.compressor.error,
+                'quantized': self.compressor.quantized,
+                'dequantized': self.compressor.dequantized,
+                'decompressed': self.compressor.decompressed
             }
-
-            # Create quantization info for results tab
-            quant_info = []
-            for i, q_info in enumerate(compressor.quantizers_info):
-                quant_info.append({
-                    'channel': i,
-                    'min': float(q_info['min']),
-                    'max': float(q_info['max'])
-                })
-
-            # Store compressor for later use
-            self.compressor = compressor
 
             result = {
                 'success': True,
@@ -674,7 +795,8 @@ class ImageCompressionGUI:
                 'original_size': original_size,
                 'compressed_size': compressed_size,
                 'images': images,
-                'quantization_info': quant_info,
+                'quantizer_tables': self.compressor.quantizer_tables,
+                'quantization_info': self.compressor.quantizers_info,
                 'num_bits': num_bits,
                 'image_folder': output_folder,
                 'binary_file': binary_file,
@@ -691,6 +813,10 @@ class ImageCompressionGUI:
         """Handle compression completion"""
         self.is_compressing = False
         self.compress_btn.config(state='normal')
+
+        # Reset progress bar
+        self.progress_var.set(0)
+        self.status_label.config(text="Ready")
 
         if result['success']:
             self.last_compression_result = result
@@ -755,161 +881,50 @@ class ImageCompressionGUI:
         self.decompression_thread.start()
 
     def run_decompression(self, binary_file, output_folder):
-        """Run decompression in thread"""
+        """Run decompression in thread using PredictiveCodingDecompressor class"""
         try:
-            self.update_progress("Reading binary file...", 20)
+            self.update_progress("Initializing decompressor...", 10)
 
-            # Read binary file header
-            with open(binary_file, 'rb') as f:
-                # Read signature
-                signature = f.read(4)
-                if signature != b'PC2D':
-                    raise ValueError("Invalid binary file format")
+            # Create decompressor instance
+            self.decompressor = PredictiveCodingDecompressor()
 
-                # Read metadata
-                width, height, channels, num_bits = struct.unpack('>HHBB', f.read(6))
+            # Run decompression
+            self.update_progress("Running decompression algorithm...", 30)
+            success = self.decompressor.decompress(binary_file)
 
-                # Read quantizer ranges
-                quantizers_info = []
-                for _ in range(channels):
-                    min_val, max_val = struct.unpack('>ff', f.read(8))
-                    quantizers_info.append({'min': min_val, 'max': max_val})
-
-                # Read compressed data
-                compressed_data = f.read()
-
-            self.update_progress("Reconstructing image...", 50)
-
-            # Calculate total pixels
-            total_pixels = width * height * channels
-
-            # Unpack bits
-            num_levels = 2 ** num_bits
-            indices = []
-
-            bit_buffer = 0
-            bits_in_buffer = 0
-            byte_index = 0
-
-            for _ in range(total_pixels):
-                while bits_in_buffer < num_bits:
-                    if byte_index >= len(compressed_data):
-                        break
-                    bit_buffer = (bit_buffer << 8) | compressed_data[byte_index]
-                    byte_index += 1
-                    bits_in_buffer += 8
-
-                shift = bits_in_buffer - num_bits
-                level = (bit_buffer >> shift) & ((1 << num_bits) - 1)
-                indices.append(level)
-
-                bit_buffer &= (1 << shift) - 1
-                bits_in_buffer -= num_bits
-
-            # Reshape indices
-            indices_array = np.array(indices, dtype=int).reshape(height, width, channels)
-
-            # Create quantizer tables
-            quantizer_tables = []
-            for q_info in quantizers_info:
-                min_val = q_info['min']
-                max_val = q_info['max']
-                step = (max_val - min_val) / num_levels
-                quantizer = []
-                for i in range(num_levels):
-                    lower = min_val + i * step
-                    upper = min_val + (i + 1) * step
-                    dequant = (lower + upper) / 2.0
-                    quantizer.append({
-                        'level': i,
-                        'lower': lower,
-                        'upper': upper,
-                        'dequant': dequant
-                    })
-                quantizer_tables.append(quantizer)
-
-            self.update_progress("Applying predictive coding...", 70)
-
-            # Reconstruct image using predictive coding
-            decompressed = np.zeros((height, width, channels), dtype=float)
-
-            for c in range(channels):
-                channel_recon = np.zeros((height, width))
-                quantizer = quantizer_tables[c]
-
-                for y in range(height):
-                    for x in range(width):
-                        # Predict
-                        if x == 0 and y == 0:
-                            pred = 128.0
-                        elif x == 0:
-                            pred = channel_recon[y-1, x]
-                        elif y == 0:
-                            pred = channel_recon[y, x-1]
-                        else:
-                            # Adaptive predictor
-                            A = channel_recon[y, x-1]
-                            B = channel_recon[y-1, x]
-                            C = channel_recon[y-1, x-1]
-
-                            min_AC = min(A, C)
-                            max_AC = max(A, C)
-
-                            if B <= min_AC:
-                                pred = max_AC
-                            elif B >= max_AC:
-                                pred = min_AC
-                            else:
-                                pred = A + C - B
-
-                        # Get quantized error
-                        level = indices_array[y, x, c]
-                        deq_err = quantizer[level]['dequant']
-
-                        # Reconstruct
-                        recon_val = np.clip(pred + deq_err, 0, 255)
-                        channel_recon[y, x] = recon_val
-                        decompressed[y, x, c] = recon_val
-
-            # If grayscale, remove channel dimension
-            if channels == 1:
-                decompressed = decompressed.squeeze()
-
-            self.update_progress("Saving decompressed images...", 90)
+            if not success:
+                raise Exception("Decompression failed")
 
             # Save decompressed image
+            self.update_progress("Saving decompressed image...", 80)
             base_name = os.path.splitext(os.path.basename(binary_file))[0]
             decompressed_path = os.path.join(output_folder, f"{base_name}_decompressed.png")
+            self.decompressor.save_image(decompressed_path)
 
-            # Convert to uint8 for saving
-            decompressed_uint8 = np.clip(decompressed, 0, 255).astype(np.uint8)
+            # Complete
+            self.update_progress("Decompression completed!", 100)
 
-            # Convert RGB to BGR for OpenCV if color
-            if channels == 3:
-                decompressed_uint8 = cv2.cvtColor(decompressed_uint8, cv2.COLOR_RGB2BGR)
-
-            cv2.imwrite(decompressed_path, decompressed_uint8)
-
-            # Create simple images for display (using available data)
+            # Create images dict for display
             images = {
-                'decompressed': decompressed,
-                'quantized': indices_array.astype(float),
-                'original': np.zeros_like(decompressed),  # Not available in decompression
-                'predicted': np.zeros_like(decompressed),  # Not available
-                'error': np.zeros_like(decompressed),  # Not available
-                'dequantized': np.zeros_like(decompressed)  # Not available
+                'decompressed': self.decompressor.decompressed,
+                'quantized': self.decompressor.quantized.astype(float),
+                'original': np.zeros_like(self.decompressor.decompressed),
+                'predicted': np.zeros_like(self.decompressor.decompressed),
+                'error': np.zeros_like(self.decompressor.decompressed),
+                'dequantized': np.zeros_like(self.decompressor.decompressed)
             }
 
             result = {
                 'success': True,
                 'images': images,
-                'quantization_info': quantizers_info,
-                'num_bits': num_bits,
+                'quantizer_tables': self.decompressor.quantizer_tables,
+                'quantization_info': self.decompressor.quantizers_info,
+                'num_bits': self.decompressor.num_bits,
                 'image_folder': output_folder,
                 'decompressed_file': decompressed_path,
-                'width': width,
-                'height': height,
-                'channels': channels
+                'width': self.decompressor.width,
+                'height': self.decompressor.height,
+                'channels': self.decompressor.channels
             }
 
         except Exception as e:
@@ -922,6 +937,10 @@ class ImageCompressionGUI:
         """Handle decompression completion"""
         self.is_decompressing = False
         self.decompress_btn.config(state='normal')
+
+        # Reset progress bar
+        self.progress_var.set(0)
+        self.status_label.config(text="Ready")
 
         if result['success']:
             # Update console
@@ -999,13 +1018,10 @@ class ImageCompressionGUI:
 
                     # Convert to PhotoImage
                     if len(display_img.shape) == 3 and display_img.shape[2] == 3:
-                        # RGB image
                         pil_image = Image.fromarray(display_img, 'RGB')
                     elif len(display_img.shape) == 3 and display_img.shape[2] == 1:
-                        # Single channel 3D array
                         pil_image = Image.fromarray(display_img[:,:,0], 'L')
                     elif len(display_img.shape) == 2:
-                        # Grayscale image
                         pil_image = Image.fromarray(display_img, 'L')
                     else:
                         pil_image = Image.fromarray(display_img)
@@ -1022,7 +1038,7 @@ class ImageCompressionGUI:
 
                     # Update label
                     self.image_labels[i].config(image=photo, text="")
-                    self.image_labels[i].image = photo  # Keep reference
+                    self.image_labels[i].image = photo
                 else:
                     self.image_labels[i].config(image="", text="Image not available")
 
@@ -1046,7 +1062,7 @@ class ImageCompressionGUI:
                 text += f"Compressed Size: {result['compressed_size']:,} bits\n\n"
 
                 text += "QUANTIZATION INFORMATION\n"
-                text += "-" * 40 + "\n"
+                text += "-" * 70 + "\n\n"
 
                 for i, q_info in enumerate(result['quantization_info']):
                     text += f"Channel {i+1}:\n"
@@ -1054,6 +1070,20 @@ class ImageCompressionGUI:
                     text += f"  Max Error: {q_info['max']:.2f}\n"
                     text += f"  Range: {q_info['max'] - q_info['min']:.2f}\n"
                     text += f"  Step Size: {(q_info['max'] - q_info['min']) / (2**result['num_bits']):.2f}\n\n"
+
+                # Add quantizer tables
+                if 'quantizer_tables' in result and result['quantizer_tables']:
+                    text += "\nQUANTIZER TABLES\n"
+                    text += "=" * 70 + "\n\n"
+
+                    for ch_idx, qtable in enumerate(result['quantizer_tables']):
+                        text += f"Channel {ch_idx + 1} Quantizer Table:\n"
+                        text += f"{'Level':<8}{'Lower':<15}{'Upper':<15}{'Dequant':<15}\n"
+                        text += "-" * 60 + "\n"
+
+                        for q in qtable:
+                            text += f"{q['level']:<8}{q['lower']:<15.4f}{q['upper']:<15.4f}{q['dequant']:<15.4f}\n"
+                        text += "\n"
 
             elif is_decompression:
                 # Decompression results
@@ -1068,9 +1098,24 @@ class ImageCompressionGUI:
 
                 if 'quantization_info' in result:
                     text += "QUANTIZATION RANGES (from binary file)\n"
-                    text += "-" * 40 + "\n"
+                    text += "-" * 70 + "\n"
                     for i, q_info in enumerate(result['quantization_info']):
                         text += f"Channel {i+1}: Min={q_info['min']:.2f}, Max={q_info['max']:.2f}\n"
+                    text += "\n"
+
+                # Add quantizer tables for decompression too
+                if 'quantizer_tables' in result and result['quantizer_tables']:
+                    text += "\nQUANTIZER TABLES (Reconstructed from binary)\n"
+                    text += "=" * 70 + "\n\n"
+
+                    for ch_idx, qtable in enumerate(result['quantizer_tables']):
+                        text += f"Channel {ch_idx + 1} Quantizer Table:\n"
+                        text += f"{'Level':<8}{'Lower':<15}{'Upper':<15}{'Dequant':<15}\n"
+                        text += "-" * 60 + "\n"
+
+                        for q in qtable:
+                            text += f"{q['level']:<8}{q['lower']:<15.4f}{q['upper']:<15.4f}{q['dequant']:<15.4f}\n"
+                        text += "\n"
 
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(1.0, text)

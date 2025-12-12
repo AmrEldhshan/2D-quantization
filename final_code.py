@@ -1,16 +1,29 @@
 import numpy as np
 import os
 from PIL import Image
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 
 
 # --------------------------
 # PredictiveCoding2D class
 # --------------------------
 class PredictiveCoding2D:
-    def __init__(self, num_bits=2):
-        self.num_bits = num_bits
+    # --------------------------
+    # Adaptive Quantizer Parameters (FIXED by the image)
+    # --------------------------
+    # Defined bin boundaries for the *error* ranges (upper bound of each level, except the last)
+    # RANGES: (-inf, -3.0], (-3.0, -0.5], (-0.5, 2.5], (2.5, 4.5], (4.5, inf)
+    Q_BINS = np.array([-3.0, -0.5, 2.5, 4.5])
+    # The Q indices (output of quantization)
+    Q_INDICES = np.array([0, 1, 2, 3])
+    # The Q^-1 values (reconstruction value)
+    Q_DEQUANT_VALUES = np.array([-4.0, -1.0, 2.0, 5.0])
+    # The number of levels defined by the table is 4
+    ADAPTIVE_LEVELS = 4
+    ADAPTIVE_BITS = 2  # 4 levels = 2 bits
+
+    def __init__(self, num_bits=None):
+        # We enforce 2 bits since the quantization table is fixed at 4 levels
+        self.num_bits = self.ADAPTIVE_BITS
         self.quantization_params = None
 
     # --------------------------
@@ -25,9 +38,10 @@ class PredictiveCoding2D:
         return np.array(img, dtype=np.float32)
 
     # --------------------------
-    # JPEG-LS Predictor
+    # JPEG-LS Predictor (Adaptive 2D Predictor from image)
     # --------------------------
     def predictiveImageGenerate(self, img):
+        #
         self.original = img.astype(np.float32)
         h, w, c = self.original.shape
         self.predicted = np.zeros_like(self.original)
@@ -35,14 +49,15 @@ class PredictiveCoding2D:
         for y in range(h):
             for x in range(w):
                 for ch in range(c):
-                    A = self.original[y, x-1, ch] if x > 0 else 0
-                    B = self.original[y-1, x, ch] if y > 0 else 0
-                    C = self.original[y-1, x-1, ch] if (x > 0 and y > 0) else 0
+                    # Neighbors
+                    A = self.original[y, x - 1, ch] if x > 0 else 0
+                    B = self.original[y - 1, x, ch] if y > 0 else 0
+                    C = self.original[y - 1, x - 1, ch] if (x > 0 and y > 0) else 0
 
-                    # JPEG-LS predictor
-                    if B < min(A, C):
+                    # JPEG-LS predictor (Formula from the image)
+                    if B <= min(A, C):
                         P = max(A, C)
-                    elif B > max(A, C):
+                    elif B >= max(A, C):
                         P = min(A, C)
                     else:
                         P = A + C - B
@@ -53,25 +68,29 @@ class PredictiveCoding2D:
         return self.predicted, self.error
 
     # --------------------------
-    # Uniform quantization
+    # Adaptive Quantization (Fixed by image table)
     # --------------------------
     def quantize_dequantize(self, error):
-        levels = 2 ** self.num_bits
-        e_min, e_max = error.min(), error.max()
-        step = (e_max - e_min) / levels
-        if step == 0:
-            step = 1e-6
+        levels = self.ADAPTIVE_LEVELS
 
-        quantized = np.floor((error - e_min) / step).astype(np.int32)
+        # 1. Quantization (Q) using fixed bins
+        # np.digitize returns the index i such that Q_BINS[i-1] < error <= Q_BINS[i]
+        quantized = np.digitize(error, self.Q_BINS)
+
+        # Clip to ensure indices are within [0, 3] (4 levels)
         quantized = np.clip(quantized, 0, levels - 1)
-        dequantized = e_min + (quantized + 0.5) * step
 
+        # 2. De-quantization (Q^-1)
+        # Use the quantized index to look up the fixed de-quantized value
+        dequantized = self.Q_DEQUANT_VALUES[quantized]
+
+        # Store parameters for reference and printout
         self.quantization_params = {
-            'e_min': e_min,
-            'e_max': e_max,
-            'step': step,
+            'e_min': error.min(),
+            'e_max': error.max(),
+            'step': np.nan,  # FIXED: Changed np.NaN to np.nan
             'levels': levels,
-            'num_bits': self.num_bits
+            'num_bits': self.ADAPTIVE_BITS
         }
 
         return quantized, dequantized
@@ -88,11 +107,9 @@ class PredictiveCoding2D:
     # --------------------------
     def save_quantized_image(self, quantized, output_path):
         """Save quantized data as a visualizable image"""
-        # Scale quantized values to 0-255 for visualization
         if quantized.max() > quantized.min():
-            # Normalize to 0-255
             quantized_img = ((quantized - quantized.min()) /
-                           (quantized.max() - quantized.min()) * 255).astype(np.uint8)
+                             (quantized.max() - quantized.min()) * 255).astype(np.uint8)
         else:
             quantized_img = np.zeros_like(quantized, dtype=np.uint8)
 
@@ -104,13 +121,13 @@ class PredictiveCoding2D:
     # Save quantized as npz (binary data)
     # --------------------------
     def save_quantized_npz(self, quantized, quant_params, output_path):
-        """Save quantized data and parameters as .npz file"""
+        """Save quantized data, prediction, and fixed parameters as .npz file"""
         np.savez_compressed(
             output_path,
             quantized=quantized,
+            predicted_data=self.predicted,  # Predicted data for single-file decompression
             e_min=quant_params['e_min'],
             e_max=quant_params['e_max'],
-            step=quant_params['step'],
             levels=quant_params['levels'],
             num_bits=quant_params['num_bits']
         )
@@ -120,30 +137,50 @@ class PredictiveCoding2D:
     # Load quantized from npz
     # --------------------------
     def load_quantized_npz(self, quantized_path):
-        """Load quantized data from .npz file"""
+        """Load quantized data, prediction, and parameters from .npz file"""
         data = np.load(quantized_path)
         quantized = data['quantized']
+        predicted = data['predicted_data']
         quant_params = {
             'e_min': data['e_min'].item(),
             'e_max': data['e_max'].item(),
-            'step': data['step'].item(),
             'levels': data['levels'].item(),
             'num_bits': data['num_bits'].item()
         }
-        return quantized, quant_params
+        return quantized, quant_params, predicted
 
     # --------------------------
     # Dequantize
     # --------------------------
     def dequantize(self, quantized, quant_params):
-        """Dequantize using saved parameters"""
-        e_min = quant_params['e_min']
-        step = quant_params['step']
-        dequantized = e_min + (quantized + 0.5) * step
+        """Dequantize using the fixed Q^-1 values (lookup table implied by the index)"""
+        dequantized = self.Q_DEQUANT_VALUES[quantized]
         return dequantized
 
     # --------------------------
-    # Compress - Saves both quantized image and npz
+    # Compression Ratio
+    # --------------------------
+    def calculate_compression_ratio(self, original_image):
+        if not isinstance(original_image, np.ndarray):
+            original_image = self.original if hasattr(self, 'original') else None
+            if original_image is None:
+                return None, 0, 0
+
+        original_bpp = 8.0
+        compressed_bpp = float(self.num_bits)
+
+        compression_ratio = original_bpp / compressed_bpp
+
+        # Estimated Size
+        original_size_bytes = original_image.size * (original_bpp / 8.0)
+        compressed_size_bytes = original_image.size * (compressed_bpp / 8.0)
+
+        ratio_string = f"{round(compression_ratio, 2)}:1"
+
+        return ratio_string, original_size_bytes, compressed_size_bytes
+
+    # --------------------------
+    # Compress
     # --------------------------
     def compress(self, img_path):
         original = self.load_image(img_path)
@@ -153,7 +190,7 @@ class PredictiveCoding2D:
         folder = "output"
         os.makedirs(folder, exist_ok=True)
 
-        # Save all images
+        # Save visualization images
         self.save_vis(original, os.path.join(folder, "1_original.png"))
         self.save_vis(predicted, os.path.join(folder, "2_predicted.png"))
         self.save_vis(error + 128, os.path.join(folder, "3_error.png"))
@@ -162,46 +199,51 @@ class PredictiveCoding2D:
         quantized_img_path = os.path.join(folder, "4_quantized.png")
         self.save_quantized_image(quantized, quantized_img_path)
 
-        # Save quantized as NPZ (binary data for decompression)
+        # Save quantized as NPZ (binary data and PREDICTION for decompression)
         quantized_npz_path = os.path.join(folder, "4_quantized.npz")
         self.save_quantized_npz(quantized, self.quantization_params, quantized_npz_path)
 
-        # Save dequantized
+        # Save dequantized error image
         dequantized_path = os.path.join(folder, "5_dequantized.png")
         self.save_vis(dequantized, dequantized_path)
 
-        # Create and save decompressed image
-        # decompressed = predicted + dequantized
-        # self.save_vis(decompressed, os.path.join(folder, "6_decompressed.png"))
-        self.decompress("./output/2_predicted.png", "./output/5_dequantized.png", "6_decompressed.png")
+        # Decompress from the generated NPZ file (using the new single-file method)
+        self.decompress_single_npz(quantized_npz_path, "6_decompressed.png")
 
-        print("\n" + "="*60)
+        # --- Calculate and Display Compression Ratio ---
+        ratio_str, original_size, compressed_size = self.calculate_compression_ratio(original)
+        if ratio_str:
+            print("\n" + "=" * 60)
+            print(f"Compression Ratio (8 bits / {self.num_bits} bits): {ratio_str} (FIXED by Adaptive Quantizer)")
+            print(f"Original size (estimated): {round(original_size / 1024, 2)} KB")
+            print(f"Compressed data size (estimated): {round(compressed_size / 1024, 2)} KB")
+            print("=" * 60)
+
+        print("\n" + "=" * 60)
         print("COMPRESSION COMPLETE! Files saved in 'output' folder:")
-        print("="*60)
+        print("=" * 60)
         print("1. Original image:              1_original.png")
         print("2. Predicted image:             2_predicted.png")
         print("3. Error (with +128 offset):    3_error.png")
         print("4. Quantized (IMAGE version):   4_quantized.png")
-        print("5. Quantized (NPZ version):     4_quantized.npz")
+        print("5. Quantized (NPZ version):     4_quantized.npz <--- Contains ALL data for decompression")
         print("6. Dequantized error:           5_dequantized.png")
         print("7. Final decompressed:          6_decompressed.png")
-        print("="*60)
+        print("=" * 60)
 
     # --------------------------
-    # Decompress from quantized npz file
+    # Decompress from single npz file (New and Recommended Method)
     # --------------------------
-    def decompress_from_npz(self, predicted_path, quantized_npz_path, output_name="decompressed_from_npz.png"):
-        """Decompress using predicted image and quantized npz file"""
-        # Load predicted image
-        predicted = self.load_image(predicted_path)
+    def decompress_single_npz(self, quantized_npz_path, output_name="decompressed_from_npz.png"):
+        """Decompress using only the quantized npz file containing predicted data and indices."""
 
-        # Load quantized data from npz
-        quantized, quant_params = self.load_quantized_npz(quantized_npz_path)
+        # Load quantized data, parameters, AND predicted data
+        quantized, quant_params, predicted = self.load_quantized_npz(quantized_npz_path)
 
-        # Dequantize
+        # Dequantize the error (uses fixed Q^-1 values)
         dequantized = self.dequantize(quantized, quant_params)
 
-        # Reconstruct
+        # Reconstruct: Predicted + Dequantized Error
         decompressed = predicted + dequantized
 
         # Save
@@ -210,19 +252,17 @@ class PredictiveCoding2D:
         output_path = os.path.join(folder, output_name)
         self.save_vis(decompressed, output_path)
 
-        print(f"\nDecompressed from npz file saved as: {output_path}")
+        print(f"\nDecompressed from single npz file saved as: {output_path}")
         return decompressed
 
     # --------------------------
-    # Decompress from images (original method)
+    # Decompress from images (Original method - kept for backward compatibility)
     # --------------------------
     def decompress(self, predicted_path, dequantized_path, output_name="decompressed.png"):
         """Decompress using predicted and dequantized images"""
         predicted = self.load_image(predicted_path)
         dequantized = self.load_image(dequantized_path)
 
-        # The dequantized image is the actual error values (not offset)
-        # So we can directly add them
         decompressed = predicted + dequantized
 
         folder = "output"
@@ -233,6 +273,51 @@ class PredictiveCoding2D:
         print(f"Decompressed image saved as: {output_path}")
         return decompressed
 
+    # --------------------------
+    # Print Quantization Table (Adapted for Adaptive/Fixed Table)
+    # --------------------------
+    def print_quantization_table(self):
+        N = self.ADAPTIVE_BITS
+        levels = self.ADAPTIVE_LEVELS
+
+        # Ranges need to be explicitly calculated from BINS
+        bin_lowers = np.insert(self.Q_BINS, 0, -np.inf)
+        bin_uppers = np.append(self.Q_BINS, np.inf)
+
+        header_width = 110
+
+        print("\n" + "=" * header_width)
+        print(f"ADAPTIVE QUANTIZATION TABLE (FIXED BY IMAGE) ({N} BITS, {levels} LEVELS)")
+        print("=" * header_width)
+        print(
+            f"Error Min (Observed): {self.quantization_params['e_min']:.4f} | Error Max (Observed): {self.quantization_params['e_max']:.4f} | Fixed Levels: {levels}")
+        print("-" * header_width)
+
+        # Header for the table
+        print(
+            f"| {'Index (Q)':<7} | {'Binary Code':<15} | {'De-quantized Value (Q^-1)':<25} | {'Input Error Range Lower, Upper':<45} |")
+        print("-" * header_width)
+
+        for i in range(levels):
+            index = i
+            binary_code = format(i, f'0{N}b')
+
+            lower = bin_lowers[i]
+            upper = bin_uppers[i]
+
+            # Format the range string (handling infinity)
+            lower_str = f"{lower:.4f}" if lower != -np.inf else "-inf"
+            upper_str = f"{upper:.4f}" if upper != np.inf else "inf"
+
+            # Format to the requested "Lower, Upper" style
+            range_str = f"{lower_str}, {upper_str}"
+
+            dequant_value = self.Q_DEQUANT_VALUES[i]
+
+            print(f"| {index:<7} | {binary_code:<15} | {dequant_value:.8f}{'':<17} | {range_str:<45} |")
+
+        print("=" * header_width)
+
 
 # --------------------------
 # CLI class
@@ -240,12 +325,12 @@ class PredictiveCoding2D:
 class CLI:
     def run(self):
         while True:
-            print("\n" + "="*50)
-            print("PREDICTIVE CODING COMPRESSION SYSTEM")
-            print("="*50)
-            print("1. Compress image (saves quantized as both PNG and NPZ)")
-            print("2. Decompress from predicted + quantized NPZ")
-            print("3. Decompress from predicted + dequantized images")
+            print("\n" + "=" * 50)
+            print("ADAPTIVE PREDICTIVE CODING SYSTEM (2 BITS FIXED)")
+            print("=" * 50)
+            print("1. Compress image (Saves all files + single-NPZ for decompression)")
+            print("2. Decompress from single quantized NPZ file (Recommended)")
+            print("3. Decompress from predicted image + dequantized image (Legacy)")
             print("4. Exit")
             choice = input("\nEnter choice (1-4): ").strip()
 
@@ -259,34 +344,26 @@ class CLI:
                     print(f"Error: File '{img_path}' not found!")
                     continue
 
-                try:
-                    num_bits = int(input("Enter number of bits for quantization (default=2): ").strip() or 2)
-                    if num_bits < 1 or num_bits > 8:
-                        print("Warning: Using 2 bits (recommended 1-8 bits)")
-                        num_bits = 2
-                except ValueError:
-                    num_bits = 2
-
-                pc = PredictiveCoding2D(num_bits=num_bits)
+                pc = PredictiveCoding2D()
                 pc.compress(img_path)
+                pc.print_quantization_table()
 
-            elif choice == "2":
-                print("\n--- Decompress from NPZ file ---")
-                predicted_path = input("Enter predicted image path: ").strip()
-                quantized_npz_path = input("Enter quantized NPZ file path: ").strip()
+            elif choice == "2":  # Single NPZ Decompression
+                print("\n--- Decompress from single NPZ file (Option 2) ---")
+                quantized_npz_path = input("Enter quantized NPZ file path (e.g., output/4_quantized.npz): ").strip()
 
-                if not os.path.exists(predicted_path) or not os.path.exists(quantized_npz_path):
-                    print("Error: One or both files not found!")
+                if not os.path.exists(quantized_npz_path):
+                    print("Error: NPZ file not found!")
                     continue
 
                 output_name = input("Enter output filename (default=decompressed_from_npz.png): ").strip()
-                output_name = output_name if output_name else "decompressed_from_npz.png"
+                output_name = output_name if output_name else "decompressed_from_npz_single.png"
 
                 pc = PredictiveCoding2D()
-                pc.decompress_from_npz(predicted_path, quantized_npz_path, output_name)
+                pc.decompress_single_npz(quantized_npz_path, output_name)
 
-            elif choice == "3":
-                print("\n--- Decompress from images ---")
+            elif choice == "3":  # Legacy Decompression
+                print("\n--- Decompress from images (Option 3) ---")
                 predicted_path = input("Enter predicted image path: ").strip()
                 dequantized_path = input("Enter dequantized image path: ").strip()
 
@@ -303,271 +380,9 @@ class CLI:
             else:
                 print("Invalid choice! Please enter 1-4.")
 
-class PredictiveCodingGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("2D Predictive Coding")
-        self.root.geometry("800x600")
-
-        # Initialize PredictiveCoding2D
-        self.pc = PredictiveCoding2D()
-
-        # Variables
-        self.selected_image = tk.StringVar()
-        self.bits_var = tk.IntVar(value=2)
-        self.predicted_path = tk.StringVar()
-        self.dequantized_path = tk.StringVar()
-
-        self.setup_ui()
-
-    def setup_ui(self):
-        # Create notebook for tabs
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
-
-        # Compress Tab
-        self.compress_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.compress_frame, text="Compress")
-        self.setup_compress_tab()
-
-        # Decompress Tab
-        self.decompress_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.decompress_frame, text="Decompress")
-        self.setup_decompress_tab()
-
-        # Status bar
-        self.status_var = tk.StringVar(value="Ready")
-        self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def setup_compress_tab(self):
-        # Title
-        title_label = ttk.Label(self.compress_frame, text="Image Compression", font=('Arial', 14, 'bold'))
-        title_label.pack(pady=10)
-
-        # Image selection
-        frame1 = ttk.LabelFrame(self.compress_frame, text="Select Image", padding=10)
-        frame1.pack(fill='x', padx=20, pady=5)
-
-        self.image_entry = ttk.Entry(frame1, textvariable=self.selected_image, width=50)
-        self.image_entry.pack(side=tk.LEFT, padx=(0, 10))
-
-        browse_btn = ttk.Button(frame1, text="Browse", command=self.browse_image)
-        browse_btn.pack(side=tk.LEFT)
-
-        # Bits selection
-        frame2 = ttk.LabelFrame(self.compress_frame, text="Quantization Bits", padding=10)
-        frame2.pack(fill='x', padx=20, pady=5)
-
-        bits_frame = ttk.Frame(frame2)
-        bits_frame.pack()
-
-        ttk.Label(bits_frame, text="Number of bits:").pack(side=tk.LEFT, padx=5)
-
-        self.bits_entry = ttk.Entry(bits_frame, textvariable=self.bits_var, width=10)
-        self.bits_entry.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(bits_frame, text="(Enter a positive integer)",
-                 font=('Arial', 9, 'italic')).pack(side=tk.LEFT, padx=5)
-
-        # Progress bar
-        self.progress = ttk.Progressbar(self.compress_frame, length=400, mode='determinate')
-        self.progress.pack(pady=10)
-
-        self.progress_label = ttk.Label(self.compress_frame, text="")
-        self.progress_label.pack()
-
-        # Compress button
-        compress_btn = ttk.Button(self.compress_frame, text="Compress Image",
-                                  command=self.compress_image, style="Accent.TButton")
-        compress_btn.pack(pady=20)
-
-        # Open output folder button
-        open_btn = ttk.Button(self.compress_frame, text="Open Output Folder",
-                              command=self.open_output_folder)
-        open_btn.pack()
-
-    def setup_decompress_tab(self):
-        # Title
-        title_label = ttk.Label(self.decompress_frame, text="Image Decompression", font=('Arial', 14, 'bold'))
-        title_label.pack(pady=10)
-
-        # Predicted image selection
-        frame1 = ttk.LabelFrame(self.decompress_frame, text="Predicted Image", padding=10)
-        frame1.pack(fill='x', padx=20, pady=5)
-
-        self.predicted_entry = ttk.Entry(frame1, textvariable=self.predicted_path, width=50)
-        self.predicted_entry.pack(side=tk.LEFT, padx=(0, 10))
-
-        browse_predicted_btn = ttk.Button(frame1, text="Browse",
-                                          command=lambda: self.browse_file(self.predicted_path))
-        browse_predicted_btn.pack(side=tk.LEFT)
-
-        # Dequantized image selection
-        frame2 = ttk.LabelFrame(self.decompress_frame, text="Dequantized Image", padding=10)
-        frame2.pack(fill='x', padx=20, pady=5)
-
-        self.dequantized_entry = ttk.Entry(frame2, textvariable=self.dequantized_path, width=50)
-        self.dequantized_entry.pack(side=tk.LEFT, padx=(0, 10))
-
-        browse_dequantized_btn = ttk.Button(frame2, text="Browse",
-                                            command=lambda: self.browse_file(self.dequantized_path))
-        browse_dequantized_btn.pack(side=tk.LEFT)
-
-        # Progress bar
-        self.decompress_progress = ttk.Progressbar(self.decompress_frame, length=400, mode='determinate')
-        self.decompress_progress.pack(pady=10)
-
-        self.decompress_label = ttk.Label(self.decompress_frame, text="")
-        self.decompress_label.pack()
-
-        # Decompress button
-        decompress_btn = ttk.Button(self.decompress_frame, text="Decompress Image",
-                                    command=self.decompress_image, style="Accent.TButton")
-        decompress_btn.pack(pady=20)
-
-        # Open output folder button
-        open_btn = ttk.Button(self.decompress_frame, text="Open Output Folder",
-                              command=self.open_output_folder)
-        open_btn.pack()
-
-    def browse_image(self):
-        file_path = filedialog.askopenfilename(
-            title="Select Image",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif")]
-        )
-        if file_path:
-            self.selected_image.set(file_path)
-
-    def browse_file(self, variable):
-        file_path = filedialog.askopenfilename(
-            title="Select Image",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif")]
-        )
-        if file_path:
-            variable.set(file_path)
-
-    def update_progress(self, value, message):
-        self.progress['value'] = value
-        self.progress_label.config(text=message)
-        self.status_var.set(message)
-        self.root.update_idletasks()
-
-    def update_decompress_progress(self, value, message):
-        self.decompress_progress['value'] = value
-        self.decompress_label.config(text=message)
-        self.status_var.set(message)
-        self.root.update_idletasks()
-
-    def compress_image(self):
-        image_path = self.selected_image.get()
-
-        if not image_path or not os.path.exists(image_path):
-            messagebox.showerror("Error", "Please select a valid image file.")
-            return
-
-        # Validate bits input
-        try:
-            num_bits = int(self.bits_var.get())
-            if num_bits < 1:
-                messagebox.showerror("Error", "Number of bits must be at least 1.")
-                return
-        except ValueError:
-            messagebox.showerror("Error", "Please enter a valid integer for number of bits.")
-            return
-
-        try:
-            # Update PredictiveCoding2D with selected bits
-            self.pc = PredictiveCoding2D(num_bits=num_bits)
-
-            # Reset progress
-            self.progress['value'] = 0
-            self.progress_label.config(text="")
-
-            # Update progress during compression
-            self.update_progress(10, "Starting compression...")
-            self.root.update()
-
-            # Start compression
-            self.pc.compress(image_path)
-
-            self.progress['value'] = 100
-            self.progress_label.config(text="Compression complete!")
-            self.status_var.set("Compression complete!")
-
-            messagebox.showinfo("Success", "Compression completed successfully!\nOutput saved in 'output' folder.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Compression failed: {str(e)}")
-
-    def decompress_image(self):
-        predicted_path = self.predicted_path.get()
-        dequantized_path = self.dequantized_path.get()
-
-        if not predicted_path or not os.path.exists(predicted_path):
-            messagebox.showerror("Error", "Please select a valid predicted image file.")
-            return
-
-        if not dequantized_path or not os.path.exists(dequantized_path):
-            messagebox.showerror("Error", "Please select a valid dequantized image file.")
-            return
-
-        try:
-            # Reset progress
-            self.decompress_progress['value'] = 0
-            self.decompress_label.config(text="")
-
-            # Update progress during decompression
-            self.update_decompress_progress(10, "Loading images...")
-            self.root.update()
-
-            self.update_decompress_progress(50, "Decompressing...")
-            self.root.update()
-
-            # Start decompression
-            self.pc.decompress(predicted_path, dequantized_path, "decompressed_only.png")
-
-            self.decompress_progress['value'] = 100
-            self.decompress_label.config(text="Decompression complete!")
-            self.status_var.set("Decompression complete!")
-
-            messagebox.showinfo("Success",
-                               f"Decompression completed successfully!\nOutput saved as: output/decompressed_only.png")
-        except Exception as e:
-            messagebox.showerror("Error", f"Decompression failed: {str(e)}")
-
-    def open_output_folder(self):
-        output_folder = "output"
-        if os.path.exists(output_folder):
-            if os.name == 'nt':
-                os.startfile(output_folder)
-            else:
-                os.system(f'open "{output_folder}"')
-        else:
-            messagebox.showinfo("Info", "Output folder doesn't exist yet. Run compression first.")
-
 
 # --------------------------
-# Main Application
+# Main Application Entry Point
 # --------------------------
-def main():
-    root = tk.Tk()
-
-    # Set ttk theme
-    style = ttk.Style()
-    style.theme_use('clam')
-
-    # Create custom style for accent button
-    style.configure("Accent.TButton", font=('Arial', 10, 'bold'))
-
-    app = PredictiveCodingGUI(root)
-    root.mainloop()
-
-
 if __name__ == "__main__":
-    main()
-
-# # --------------------------
-# # Main
-# # --------------------------
-# if __name__ == "__main__":
-    # CLI().run()
+    CLI().run()
