@@ -1,454 +1,519 @@
+import numpy as np
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import os
-from datetime import datetime
-import threading
-import json
-import numpy as np
-import struct
-import cv2
 from PIL import Image, ImageTk
+import sys
+from io import StringIO
 
 
-# ============================================================================
-# PredictiveCoding2D Class - Core Compression Logic
-# ============================================================================
+
+# --------------------------
+# PredictiveCoding2D class
+# --------------------------
 class PredictiveCoding2D:
-    def __init__(self, num_bits=2, use_color=True):
-        """
-        Initialize the system with user-defined bits.
-        Default is 2 bits (4 levels: 00, 01, 10, 11).
-        """
-        self.num_bits = num_bits
-        self.num_levels = 2 ** num_bits
-        self.use_color = use_color
+    # These are the default 2-bit parameters from your table
+    Q_BINS_2BIT = np.array([-3.0, -0.5, 2.5, 4.5])
+    Q_DEQUANT_VALUES_2BIT = np.array([-4.0, -1.0, 2.0, 5.0])
+    ADAPTIVE_LEVELS_2BIT = 4
+    ADAPTIVE_BITS_2BIT = 2
 
-        # Store quantizer settings for the binary header
-        self.quantizers_info = []
-        self.quantizer_tables = []  # Store the actual quantizer tables
-
-        # Image Buffers
-        self.original = None
-        self.predicted = None
-        self.error = None
-        self.quantized = None     # Stores indices (0, 1, 2, 3)
-        self.dequantized = None   # Stores actual values (e.g., -10.5, 5.2)
-        self.decompressed = None  # Reconstructed image
-
-    def adaptive_predictor(self, A, B, C):
-        """
-        Adaptive 2D Predictor Logic
-        """
-        min_AC = min(A, C)
-        max_AC = max(A, C)
-
-        if B <= min_AC:
-            return max_AC
-        elif B >= max_AC:
-            return min_AC
+    def __init__(self, num_bits=None):
+        # Set number of bits (default to 2 if not specified)
+        if num_bits is None:
+            self.num_bits = self.ADAPTIVE_BITS_2BIT
         else:
-            return A + C - B
+            self.num_bits = num_bits
 
-    def create_uniform_quantizer(self, min_val, max_val):
-        """
-        Creates a dynamic uniform quantizer based on error range
-        """
-        quantizer = []
-        # Avoid division by zero
-        range_val = max_val - min_val
-        if abs(range_val) < 1e-10:
-            range_val = 1.0
+        # Initialize quantization parameters that will be created based on num_bits
+        self.Q_BINS = None
+        self.Q_DEQUANT_VALUES = None
+        self.ADAPTIVE_LEVELS = None
+        self.quantization_params = None
 
-        step = range_val / self.num_levels
+        # Generate quantization tables based on number of bits
+        self._generate_quantization_tables()
 
-        for i in range(self.num_levels):
-            lower = min_val + i * step
-            upper = min_val + (i + 1) * step
-            # Reconstruction value is the midpoint
-            dequant = (lower + upper) / 2.0
-
-            quantizer.append({
-                'level': i,
-                'lower': lower,
-                'upper': upper,
-                'dequant': dequant
-            })
-        return quantizer
-
-    def quantize_value(self, value, quantizer):
-        """Maps an error value to a specific level index and de-quantized value"""
-        # 1. Check boundaries (Optimization)
-        if value < quantizer[0]['lower']:
-            return quantizer[0]['level'], quantizer[0]['dequant']
-        if value >= quantizer[-1]['upper']:
-            return quantizer[-1]['level'], quantizer[-1]['dequant']
-
-        # 2. Linear search for the bin
-        for q in quantizer:
-            if q['lower'] <= value < q['upper']:
-                return q['level'], q['dequant']
-
-        # Fallback
-        return quantizer[-1]['level'], quantizer[-1]['dequant']
-
-    def compress(self, image_path):
-        print("\n" + "="*60)
-        print(f"Starting Compression ({self.num_bits} bits)...")
-
-        # --- 1. Load Image ---
-        img = cv2.imread(image_path)
-        if img is None:
-            print("Error: Image not found.")
-            return False
-
-        # Convert BGR (OpenCV standard) to RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        if self.use_color:
-            self.original = img.astype(float)
+    def _generate_quantization_tables(self):
+        """Generate quantization tables based on the number of bits"""
+        if self.num_bits == 2:
+            # Use the predefined 2-bit table
+            self.Q_BINS = self.Q_BINS_2BIT
+            self.Q_DEQUANT_VALUES = self.Q_DEQUANT_VALUES_2BIT
+            self.ADAPTIVE_LEVELS = self.ADAPTIVE_LEVELS_2BIT
         else:
-            self.original = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(float)
-            # Add channel dimension for consistency: (H, W, 1)
-            self.original = self.original[:, :, np.newaxis]
+            # For other bit depths, create uniform quantization tables
+            # This is a simple implementation - you might want to customize it
+            levels = 2 ** self.num_bits
 
-        height, width, channels = self.original.shape
+            # Create uniform quantization bins from -255 to 255 (covering full error range)
+            # You can adjust this range based on your needs
+            min_error = -255.0
+            max_error = 255.0
 
-        # Initialize Output Arrays
+            # Create uniform quantization bins
+            step = (max_error - min_error) / levels
+            self.Q_BINS = np.array([min_error + i * step for i in range(1, levels)])
+
+            # Create reconstruction values (midpoints of bins)
+            self.Q_DEQUANT_VALUES = np.array([min_error + (i + 0.5) * step for i in range(levels)])
+
+            self.ADAPTIVE_LEVELS = levels
+
+    # --------------------------
+    # Load image
+    # --------------------------
+    def load_image(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError("Image path does not exist.")
+        img = Image.open(path)
+        if img.mode != 'RGB':
+            img = img.convert("RGB")
+        return np.array(img, dtype=np.float32)
+
+    # --------------------------
+    # JPEG-LS Predictor (Adaptive 2D Predictor from image)
+    # --------------------------
+    def predictiveImageGenerate(self, img):
+        self.original = img.astype(np.float32)
+        h, w, c = self.original.shape
         self.predicted = np.zeros_like(self.original)
-        self.error = np.zeros_like(self.original)
-        self.quantized = np.zeros_like(self.original, dtype=int)
-        self.dequantized = np.zeros_like(self.original)
-        self.decompressed = np.zeros_like(self.original)
-        self.quantizers_info = [] # Reset
-        self.quantizer_tables = [] # Reset
 
-        # --- 2. Process Each Channel Separately ---
-        for c in range(channels):
-            print(f"Processing Channel {c+1}/{channels}...")
-            channel_orig = self.original[:, :, c]
+        for y in range(h):
+            for x in range(w):
+                for ch in range(c):
+                    # Neighbors
+                    A = self.original[y, x - 1, ch] if x > 0 else 0
+                    B = self.original[y - 1, x, ch] if y > 0 else 0
+                    C = self.original[y - 1, x - 1, ch] if (x > 0 and y > 0) else 0
 
-            # --- PASS 1: Range Estimation ---
-            temp_errors = []
-            for y in range(0, height, 4):
-                for x in range(0, width, 4):
-                    if x==0 and y==0: p=128.0
-                    elif x==0: p=channel_orig[y-1, x]
-                    elif y==0: p=channel_orig[y, x-1]
-                    else: p=self.adaptive_predictor(channel_orig[y, x-1], channel_orig[y-1, x], channel_orig[y-1, x-1])
-                    temp_errors.append(channel_orig[y, x] - p)
-
-            min_e, max_e = min(temp_errors), max(temp_errors)
-
-            # Create Quantizer Table for this channel
-            q_table = self.create_uniform_quantizer(min_e, max_e)
-            self.quantizers_info.append({'min': min_e, 'max': max_e})
-            self.quantizer_tables.append(q_table)  # Store the table
-
-            # --- PASS 2: Feedback Loop (Real Compression) ---
-            channel_recon = np.zeros((height, width))
-
-            for y in range(height):
-                for x in range(width):
-                    # A. Predict
-                    if x==0 and y==0: pred = 128.0
-                    elif x==0: pred = channel_recon[y-1, x]
-                    elif y==0: pred = channel_recon[y, x-1]
+                    # JPEG-LS predictor
+                    if B <= min(A, C):
+                        P = max(A, C)
+                    elif B >= max(A, C):
+                        P = min(A, C)
                     else:
-                        pred = self.adaptive_predictor(channel_recon[y, x-1], channel_recon[y-1, x], channel_recon[y-1, x-1])
+                        P = A + C - B
 
-                    self.predicted[y, x, c] = pred
+                    self.predicted[y, x, ch] = P
 
-                    # B. Calculate Error
-                    real_val = channel_orig[y, x]
-                    err = real_val - pred
-                    self.error[y, x, c] = err
+        self.error = self.original - self.predicted
+        return self.predicted, self.error
 
-                    # C. Quantize Error
-                    level, deq_err = self.quantize_value(err, q_table)
-                    self.quantized[y, x, c] = level      # Store index (0-3)
-                    self.dequantized[y, x, c] = deq_err  # Store value (e.g. -12.5)
+    # --------------------------
+    # Adaptive Quantization - per channel
+    # --------------------------
+    def quantize_dequantize(self, error):
+        """Quantize and dequantize each channel"""
+        levels = self.ADAPTIVE_LEVELS
+        h, w, c = error.shape
 
-                    # D. Reconstruct (Feedback)
-                    recon_val = np.clip(pred + deq_err, 0, 255)
-                    channel_recon[y, x] = recon_val
-                    self.decompressed[y, x, c] = recon_val
+        quantized = np.zeros_like(error, dtype=np.int32)
+        dequantized = np.zeros_like(error, dtype=np.float32)
 
-        # Cleanup dimensions for grayscale
-        if not self.use_color:
-            self.original = self.original.squeeze()
-            self.decompressed = self.decompressed.squeeze()
+        # Store parameters for each channel
+        self.quantization_params = []
 
-        print("Compression Logic Complete.")
-        return True
+        # Process each channel independently
+        for ch in range(c):
+            error_ch = error[:, :, ch]
 
-    def save_binary_file(self, output_path="output/compressed_data.bin"):
-        """
-        Saves the '4_Quantized' data as a PACKED BINARY FILE.
-        """
-        if self.quantized is None:
-            return
+            # 1. Quantization (Q) using bins
+            quantized_ch = np.digitize(error_ch, self.Q_BINS)
+            quantized_ch = np.clip(quantized_ch, 0, levels - 1)
+            quantized[:, :, ch] = quantized_ch
 
-        print(f"\n[Binary] Packing bits to '{output_path}'...")
+            # 2. De-quantization (Q^-1)
+            dequantized[:, :, ch] = self.Q_DEQUANT_VALUES[quantized_ch]
 
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            # Store parameters for this channel
+            self.quantization_params.append({
+                'channel': ch,
+                'e_min': error_ch.min(),
+                'e_max': error_ch.max(),
+                'bins': self.Q_BINS.copy(),
+                'dequant_values': self.Q_DEQUANT_VALUES.copy(),
+                'levels': levels,
+                'num_bits': self.num_bits
+            })
 
-        h, w = self.quantized.shape[:2]
-        c = 3 if self.use_color else 1
+        return quantized, dequantized
 
-        with open(output_path, 'wb') as f:
-            # --- HEADER ---
-            f.write(b'PC2D')
-            f.write(struct.pack('>HHBB', w, h, c, self.num_bits))
+    # --------------------------
+    # Save image helper
+    # --------------------------
+    def save_vis(self, img, path):
+        img_clipped = np.clip(img, 0, 255).astype(np.uint8)
+        Image.fromarray(img_clipped).save(path)
 
-            # Quantizer Ranges
-            for q_info in self.quantizers_info:
-                f.write(struct.pack('>ff', q_info['min'], q_info['max']))
+    # --------------------------
+    # Save quantized as image visualized
+    # --------------------------
+    def save_quantized_image(self, quantized, output_path):
+        """Save quantized data as a visualizable image (per channel)"""
+        quantized_img = np.zeros_like(quantized, dtype=np.uint8)
 
-            # --- DATA BODY ---
-            flat_indices = self.quantized.flatten().astype(int)
+        for ch in range(quantized.shape[2]):
+            ch_data = quantized[:, :, ch]
+            if ch_data.max() > ch_data.min():
+                quantized_img[:, :, ch] = ((ch_data - ch_data.min()) /
+                                           (ch_data.max() - ch_data.min()) * 255).astype(np.uint8)
 
-            bit_buffer = 0
-            bits_in_buffer = 0
-            byte_array = bytearray()
+        Image.fromarray(quantized_img).save(output_path)
+        print(f"Quantized image saved to: {output_path}")
+        return quantized_img
 
-            for level in flat_indices:
-                bit_buffer = (bit_buffer << self.num_bits) | level
-                bits_in_buffer += self.num_bits
+    # --------------------------
+    # Save quantized as npz binary data - per channel
+    # --------------------------
+    def save_quantized_npz(self, quantized, quant_params, output_path):
+        """Save quantized data, prediction, and parameters per channel as .npz file"""
+        # Store channel-specific parameters
+        save_dict = {
+            'quantized': quantized,
+            'predicted_data': self.predicted,
+            'num_channels': quantized.shape[2],
+            'num_bits': self.num_bits
+        }
 
-                while bits_in_buffer >= 8:
-                    byte_val = (bit_buffer >> (bits_in_buffer - 8)) & 0xFF
-                    byte_array.append(byte_val)
-                    bits_in_buffer -= 8
+        # Store parameters for each channel
+        for ch, params in enumerate(quant_params):
+            save_dict[f'e_min_ch{ch}'] = params['e_min']
+            save_dict[f'e_max_ch{ch}'] = params['e_max']
+            save_dict[f'bins_ch{ch}'] = params['bins']
+            save_dict[f'dequant_values_ch{ch}'] = params['dequant_values']
+            save_dict[f'levels_ch{ch}'] = params['levels']
+            save_dict[f'num_bits_ch{ch}'] = params['num_bits']
 
-            if bits_in_buffer > 0:
-                byte_val = (bit_buffer << (8 - bits_in_buffer)) & 0xFF
-                byte_array.append(byte_val)
+        np.savez_compressed(output_path, **save_dict)
+        print(f"Quantized data (npz) saved to: {output_path}")
 
-            f.write(byte_array)
+    # --------------------------
+    # Load quantized from npz - per channel
+    # --------------------------
+    def load_quantized_npz(self, quantized_path):
+        """Load quantized data, prediction, and parameters from .npz file"""
+        data = np.load(quantized_path)
+        quantized = data['quantized']
+        predicted = data['predicted_data']
+        num_channels = data['num_channels'].item()
+        num_bits = data['num_bits'].item()
 
-        # Calculate compression stats
-        bin_size = os.path.getsize(output_path)
-        raw_size = h * w * c
-        print(f"  Binary File Size: {bin_size/1024:.2f} KB")
-        print(f"  Original Raw Size: {raw_size/1024:.2f} KB")
-        print(f"  Compression Ratio: {raw_size/bin_size:.2f}:1")
+        # Set up the quantization tables based on loaded bits
+        self.num_bits = num_bits
+        self._generate_quantization_tables()
 
-    def save_images(self, output_dir="output"):
-        """Saves the 6 visual images required by the assignment"""
-        if not os.path.exists(output_dir): os.makedirs(output_dir)
+        quant_params = []
+        for ch in range(num_channels):
+            quant_params.append({
+                'channel': ch,
+                'e_min': data[f'e_min_ch{ch}'].item(),
+                'e_max': data[f'e_max_ch{ch}'].item(),
+                'bins': data[f'bins_ch{ch}'],
+                'dequant_values': data[f'dequant_values_ch{ch}'],
+                'levels': data[f'levels_ch{ch}'].item(),
+                'num_bits': data[f'num_bits_ch{ch}'].item()
+            })
 
-        def save_vis(img, name):
-            if img is None: return
-            _min, _max = img.min(), img.max()
-            if _max > _min:
-                vis = ((img - _min) / (_max - _min) * 255).astype(np.uint8)
+        return quantized, quant_params, predicted
+
+    # --------------------------
+    # Dequantize - PER CHANNEL
+    # --------------------------
+    def dequantize(self, quantized, quant_params):
+        """Dequantize using the dequantization values from parameters"""
+        h, w, c = quantized.shape
+        dequantized = np.zeros_like(quantized, dtype=np.float32)
+
+        for ch in range(c):
+            # Use the dequantization values from the saved parameters
+            dequant_values = quant_params[ch]['dequant_values']
+            dequantized[:, :, ch] = dequant_values[quantized[:, :, ch]]
+
+        return dequantized
+
+    # --------------------------
+    # Compression Ratio
+    # --------------------------
+    def calculate_compression_ratio(self, original_image):
+        if not isinstance(original_image, np.ndarray):
+            original_image = self.original if hasattr(self, 'original') else None
+            if original_image is None:
+                return None, 0, 0
+
+        original_bpp = 8.0 * 3  # 8 bits per channel * 3 channels
+        compressed_bpp = float(self.num_bits * 3)  # user bits per channel * 3 channels
+
+        compression_ratio = original_bpp / compressed_bpp
+
+        # Estimated Size
+        original_size_bytes = original_image.size * (8.0 / 8.0)  # 8 bits per pixel
+        compressed_size_bytes = original_image.size * (self.num_bits / 8.0)  # user bits per pixel
+
+        ratio_string = f"{round(compression_ratio, 2)}:1"
+
+        return ratio_string, original_size_bytes, compressed_size_bytes
+
+    # --------------------------
+    # Compress
+    # --------------------------
+    def compress(self, img_path, num_bits=None):
+        # Update bits if specified
+        if num_bits is not None:
+            self.num_bits = num_bits
+            self._generate_quantization_tables()
+
+        original = self.load_image(img_path)
+        predicted, error = self.predictiveImageGenerate(original)
+        quantized, dequantized = self.quantize_dequantize(error)
+
+        folder = "output"
+        os.makedirs(folder, exist_ok=True)
+
+        # Save visualization images
+        self.save_vis(original, os.path.join(folder, "1_original.png"))
+        self.save_vis(predicted, os.path.join(folder, "2_predicted.png"))
+        self.save_vis(error + 128, os.path.join(folder, "3_error.png"))
+
+        # Save quantized as IMAGE (visualization)
+        quantized_img_path = os.path.join(folder, "4_quantized.png")
+        self.save_quantized_image(quantized, quantized_img_path)
+
+        # Save quantized as NPZ (binary data and PREDICTION for decompression)
+        quantized_npz_path = os.path.join(folder, "4_quantized.npz")
+        self.save_quantized_npz(quantized, self.quantization_params, quantized_npz_path)
+
+        # Save dequantized error image
+        dequantized_path = os.path.join(folder, "5_dequantized.png")
+        self.save_vis(dequantized, dequantized_path)
+
+        # Decompress from the generated NPZ file
+        self.decompress_single_npz(quantized_npz_path, "6_decompressed.png")
+
+        # --- Calculate and Display Compression Ratio ---
+        ratio_str, original_size, compressed_size = self.calculate_compression_ratio(original)
+        if ratio_str:
+            print("\n" + "=" * 60)
+            print(f"Compression Ratio (24 bits / {self.num_bits*3} bits): {ratio_str}")
+            print(f"Bits per channel: {self.num_bits} bits")
+            print(f"Original size (estimated): {round(original_size / 1024, 2)} KB")
+            print(f"Compressed data size (estimated): {round(compressed_size / 1024, 2)} KB")
+            print("=" * 60)
+
+        print("\n" + "=" * 60)
+        print(f"COMPRESSION COMPLETE! Files saved in 'output' folder (using {self.num_bits} bits/channel):")
+        print("=" * 60)
+        print("1. Original image:              1_original.png")
+        print("2. Predicted image:             2_predicted.png")
+        print("3. Error (with +128 offset):    3_error.png")
+        print("4. Quantized (IMAGE version):   4_quantized.png")
+        print("5. Quantized (NPZ version):     4_quantized.npz <--- Contains ALL data for decompression")
+        print("6. Dequantized error:           5_dequantized.png")
+        print("7. Final decompressed:          6_decompressed.png")
+        print("=" * 60)
+
+    # --------------------------
+    # Decompress from single npz file
+    # --------------------------
+    def decompress_single_npz(self, quantized_npz_path, output_name="decompressed_from_npz.png"):
+        """Decompress using only the quantized npz file containing predicted data and indices."""
+
+        # Load quantized data, parameters, AND predicted data
+        quantized, quant_params, predicted = self.load_quantized_npz(quantized_npz_path)
+
+        # Dequantize the error
+        dequantized = self.dequantize(quantized, quant_params)
+
+        # Reconstruct: Predicted + Dequantized Error
+        decompressed = predicted + dequantized
+
+        # Save
+        folder = "output"
+        os.makedirs(folder, exist_ok=True)
+        output_path = os.path.join(folder, output_name)
+        self.save_vis(decompressed, output_path)
+
+        print(f"\nDecompressed from single npz file saved as: {output_path}")
+        print(f"Using {self.num_bits} bits per channel")
+        return decompressed
+
+    # --------------------------
+    # Decompress from images (Original method)
+    # --------------------------
+    def decompress(self, predicted_path, dequantized_path, output_name="decompressed.png"):
+        """Decompress using predicted and dequantized images"""
+        predicted = self.load_image(predicted_path)
+        dequantized = self.load_image(dequantized_path)
+
+        decompressed = predicted + dequantized
+
+        folder = "output"
+        os.makedirs(folder, exist_ok=True)
+        output_path = os.path.join(folder, output_name)
+        self.save_vis(decompressed, output_path)
+
+        print(f"Decompressed image saved as: {output_path}")
+        return decompressed
+
+    # --------------------------
+    # Print Quantization Table - PER CHANNEL
+    # --------------------------
+    def print_quantization_table(self):
+        N = self.num_bits
+        levels = self.ADAPTIVE_LEVELS
+
+        # Ranges need to be explicitly calculated from BINS
+        bin_lowers = np.insert(self.Q_BINS, 0, -np.inf)
+        bin_uppers = np.append(self.Q_BINS, np.inf)
+
+        header_width = 110
+
+        # Print table for each channel
+        for ch_params in self.quantization_params:
+            ch = ch_params['channel']
+            channel_names = ['RED', 'GREEN', 'BLUE']
+
+            print("\n" + "=" * header_width)
+            print(f"QUANTIZATION TABLE - {channel_names[ch]} CHANNEL ({N} BITS, {levels} LEVELS)")
+            print("=" * header_width)
+            print(f"Error Min (Observed): {ch_params['e_min']:.4f} | Error Max (Observed): {ch_params['e_max']:.4f} | Levels: {levels}")
+            print("-" * header_width)
+
+            # Header for the table
+            print(f"| {'Index (Q)':<7} | {'Binary Code':<15} | {'De-quantized Value (Q^-1)':<25} | {'Input Error Range Lower, Upper':<45} |")
+            print("-" * header_width)
+
+            for i in range(levels):
+                index = i
+                binary_code = format(i, f'0{N}b')
+
+                lower = bin_lowers[i]
+                upper = bin_uppers[i]
+
+                # Format the range string (handling infinity)
+                lower_str = f"{lower:.4f}" if lower != -np.inf else "-inf"
+                upper_str = f"{upper:.4f}" if upper != np.inf else "inf"
+
+                # Format to the requested "Lower, Upper" style
+                range_str = f"{lower_str}, {upper_str}"
+
+                dequant_value = self.Q_DEQUANT_VALUES[i]
+
+                print(f"| {index:<7} | {binary_code:<15} | {dequant_value:.8f}{'':<17} | {range_str:<45} |")
+
+            print("=" * header_width)
+
+
+# # --------------------------
+# # CLI class
+# # --------------------------
+class CLI:
+    def run(self):
+        while True:
+            print("\n" + "=" * 60)
+            print("ADAPTIVE PREDICTIVE CODING SYSTEM")
+            print("Per-Channel Processing Enabled")
+            print("=" * 60)
+            print("1. Compress image (Specify bits per channel)")
+            print("2. Decompress from single quantized NPZ file (Recommended)")
+            print("3. Decompress from predicted image + dequantized image (Legacy)")
+            print("4. Exit")
+            choice = input("\nEnter choice (1-4): ").strip()
+
+            if choice == "4":
+                print("Exiting...")
+                return
+
+            if choice == "1":
+                img_path = input("Enter image file path (jpg/png): ").strip()
+                if not os.path.exists(img_path):
+                    print(f"Error: File '{img_path}' not found!")
+                    continue
+
+                # Ask for number of bits with default value
+                bits_input = input("Enter number of bits per channel (default=2): ").strip()
+                if bits_input == "":
+                    num_bits = 2  # Default value
+                else:
+                    try:
+                        num_bits = int(bits_input)
+                        if num_bits <= 0 or num_bits > 8:
+                            print("Warning: Bits should be between 1 and 8. Using default (2).")
+                            num_bits = 2
+                    except ValueError:
+                        print("Invalid input. Using default (2 bits).")
+                        num_bits = 2
+
+                print(f"\nUsing {num_bits} bits per channel...")
+
+                pc = PredictiveCoding2D(num_bits=num_bits)
+                pc.compress(img_path)
+                pc.print_quantization_table()
+
+            elif choice == "2":  # Single NPZ Decompression
+                print("\n--- Decompress from single NPZ file (Option 2) ---")
+                quantized_npz_path = input("Enter quantized NPZ file path (e.g., output/4_quantized.npz): ").strip()
+
+                if not os.path.exists(quantized_npz_path):
+                    print("Error: NPZ file not found!")
+                    continue
+
+                output_name = input("Enter output filename (default=decompressed_from_npz.png): ").strip()
+                output_name = output_name if output_name else "decompressed_from_npz.png"
+
+                # Create instance without specifying bits (will be loaded from file)
+                pc = PredictiveCoding2D()
+                pc.decompress_single_npz(quantized_npz_path, output_name)
+
+            elif choice == "3":  # Legacy Decompression
+                print("\n--- Decompress from images (Option 3) ---")
+                predicted_path = input("Enter predicted image path: ").strip()
+                dequantized_path = input("Enter dequantized image path: ").strip()
+
+                if not os.path.exists(predicted_path) or not os.path.exists(dequantized_path):
+                    print("Error: One or both files not found!")
+                    continue
+
+                output_name = input("Enter output filename (default=decompressed.png): ").strip()
+                output_name = output_name if output_name else "decompressed.png"
+
+                # Create instance with default bits (won't matter for this method)
+                pc = PredictiveCoding2D()
+                pc.decompress(predicted_path, dequantized_path, output_name)
+
             else:
-                vis = img.astype(np.uint8)
-
-            if len(vis.shape) == 3:
-                vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
-
-            cv2.imwrite(os.path.join(output_dir, name), vis)
-
-        print(f"\n[Visuals] Saving PNGs to '{output_dir}'...")
-
-        save_vis(self.original, "1_original.png")
-        save_vis(self.predicted, "2_predicted.png")
-        save_vis(self.error, "3_error.png")
-        save_vis(self.quantized, "4_quantized.png")
-        save_vis(self.dequantized, "5_dequantized.png")
-        save_vis(self.decompressed, "6_decompressed.png")
+                print("Invalid choice! Please enter 1-4.")
 
 
-# ============================================================================
-# Decompressor Class - Separate Decompression Logic
-# ============================================================================
-class PredictiveCodingDecompressor:
-    def __init__(self):
-        self.decompressed = None
-        self.quantized = None
-        self.width = 0
-        self.height = 0
-        self.channels = 0
-        self.num_bits = 0
-        self.quantizers_info = []
-        self.quantizer_tables = []
-
-    def adaptive_predictor(self, A, B, C):
-        """Same adaptive predictor as compression"""
-        min_AC = min(A, C)
-        max_AC = max(A, C)
-
-        if B <= min_AC:
-            return max_AC
-        elif B >= max_AC:
-            return min_AC
-        else:
-            return A + C - B
-
-    def decompress(self, binary_file):
-        """Decompress a binary file"""
-        print("\n" + "="*60)
-        print(f"Starting Decompression...")
-
-        try:
-            # Read binary file
-            with open(binary_file, 'rb') as f:
-                # Read signature
-                signature = f.read(4)
-                if signature != b'PC2D':
-                    raise ValueError("Invalid binary file format")
-
-                # Read metadata
-                self.width, self.height, self.channels, self.num_bits = struct.unpack('>HHBB', f.read(6))
-                print(f"Image: {self.width}x{self.height}, {self.channels} channel(s), {self.num_bits} bits")
-
-                # Read quantizer ranges
-                self.quantizers_info = []
-                for _ in range(self.channels):
-                    min_val, max_val = struct.unpack('>ff', f.read(8))
-                    self.quantizers_info.append({'min': min_val, 'max': max_val})
-
-                # Read compressed data
-                compressed_data = f.read()
-
-            # Calculate total pixels
-            total_pixels = self.width * self.height * self.channels
-
-            # Unpack bits
-            num_levels = 2 ** self.num_bits
-            indices = []
-
-            bit_buffer = 0
-            bits_in_buffer = 0
-            byte_index = 0
-
-            for _ in range(total_pixels):
-                while bits_in_buffer < self.num_bits:
-                    if byte_index >= len(compressed_data):
-                        break
-                    bit_buffer = (bit_buffer << 8) | compressed_data[byte_index]
-                    byte_index += 1
-                    bits_in_buffer += 8
-
-                shift = bits_in_buffer - self.num_bits
-                level = (bit_buffer >> shift) & ((1 << self.num_bits) - 1)
-                indices.append(level)
-
-                bit_buffer &= (1 << shift) - 1
-                bits_in_buffer -= self.num_bits
-
-            # Reshape indices
-            self.quantized = np.array(indices, dtype=int).reshape(self.height, self.width, self.channels)
-
-            # Create quantizer tables
-            self.quantizer_tables = []
-            for q_info in self.quantizers_info:
-                min_val = q_info['min']
-                max_val = q_info['max']
-                step = (max_val - min_val) / num_levels
-                quantizer = []
-                for i in range(num_levels):
-                    lower = min_val + i * step
-                    upper = min_val + (i + 1) * step
-                    dequant = (lower + upper) / 2.0
-                    quantizer.append({
-                        'level': i,
-                        'lower': lower,
-                        'upper': upper,
-                        'dequant': dequant
-                    })
-                self.quantizer_tables.append(quantizer)
-
-            # Reconstruct image
-            self.decompressed = np.zeros((self.height, self.width, self.channels), dtype=float)
-
-            for c in range(self.channels):
-                channel_recon = np.zeros((self.height, self.width))
-                quantizer = self.quantizer_tables[c]
-
-                for y in range(self.height):
-                    for x in range(self.width):
-                        # Predict
-                        if x == 0 and y == 0:
-                            pred = 128.0
-                        elif x == 0:
-                            pred = channel_recon[y-1, x]
-                        elif y == 0:
-                            pred = channel_recon[y, x-1]
-                        else:
-                            A = channel_recon[y, x-1]
-                            B = channel_recon[y-1, x]
-                            C = channel_recon[y-1, x-1]
-                            pred = self.adaptive_predictor(A, B, C)
-
-                        # Get quantized error
-                        level = self.quantized[y, x, c]
-                        deq_err = quantizer[level]['dequant']
-
-                        # Reconstruct
-                        recon_val = np.clip(pred + deq_err, 0, 255)
-                        channel_recon[y, x] = recon_val
-                        self.decompressed[y, x, c] = recon_val
-
-            # If grayscale, remove channel dimension
-            if self.channels == 1:
-                self.decompressed = self.decompressed.squeeze()
-                self.quantized = self.quantized.squeeze()
-
-            print("Decompression Complete.")
-            return True
-
-        except Exception as e:
-            print(f"Decompression failed: {e}")
-            return False
-
-    def save_image(self, output_path):
-        """Save the decompressed image"""
-        if self.decompressed is None:
-            return False
-
-        # Convert to uint8
-        decompressed_uint8 = np.clip(self.decompressed, 0, 255).astype(np.uint8)
-
-        # Convert RGB to BGR for OpenCV if color
-        if len(decompressed_uint8.shape) == 3 and decompressed_uint8.shape[2] == 3:
-            decompressed_uint8 = cv2.cvtColor(decompressed_uint8, cv2.COLOR_RGB2BGR)
-
-        cv2.imwrite(output_path, decompressed_uint8)
-        print(f"Decompressed image saved to: {output_path}")
-        return True
+# # --------------------------
+# # Main Application Entry Point
+# # --------------------------
+# if __name__ == "__main__":
+#     CLI().run()
 
 
-# ============================================================================
-# GUI Class
-# ============================================================================
+
+# --------------------------
+# ImageCompressionGUI class
+# --------------------------
 class ImageCompressionGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Image Compression System")
+        self.root.title("Adaptive Predictive Coding System")
         self.root.geometry("1200x800")
 
-        # Initialize compressor and decompressor
-        self.compressor = None
-        self.decompressor = None
-
-        # Threading variables
-        self.compression_thread = None
-        self.decompression_thread = None
-        self.is_compressing = False
-        self.is_decompressing = False
-
-        # Storage for compression results
+        # Initialize compressor
+        self.pc = None
         self.last_compression_result = None
 
         # Image display variables
-        self.current_images = None
         self.image_labels = []
 
         # Setup GUI
         self.setup_gui()
+
+        # Ensure output directory exists
+        os.makedirs("output", exist_ok=True)
 
     def setup_gui(self):
         """Setup the main GUI layout"""
@@ -462,7 +527,7 @@ class ImageCompressionGUI:
 
         # Title
         title_label = ttk.Label(main_container,
-                               text="IMAGE COMPRESSION SYSTEM",
+                               text="ADAPTIVE PREDICTIVE CODING SYSTEM",
                                font=('Arial', 16, 'bold'))
         title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
 
@@ -528,32 +593,34 @@ class ImageCompressionGUI:
         browse_btn = ttk.Button(input_frame, text="Browse", command=self.browse_image)
         browse_btn.grid(row=0, column=2, pady=5)
 
-        # Number of bits
-        ttk.Label(input_frame, text="Number of Bits (1-8, Default=2):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        # Number of bits input
+        ttk.Label(input_frame, text="Number of Bits per Channel:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.bits_var = tk.StringVar(value="2")
         self.bits_entry = ttk.Entry(input_frame, textvariable=self.bits_var, width=10)
         self.bits_entry.grid(row=1, column=1, sticky=tk.W, pady=5, padx=5)
-
-        # Color mode
-        ttk.Label(input_frame, text="Color Mode:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.color_mode_var = tk.StringVar(value="Color")
-        color_combo = ttk.Combobox(input_frame, textvariable=self.color_mode_var,
-                                  values=["Color", "Grayscale"], state="readonly", width=15)
-        color_combo.grid(row=2, column=1, sticky=tk.W, pady=5, padx=5)
+        ttk.Label(input_frame, text="(Default: 2)").grid(row=1, column=2, sticky=tk.W, pady=5)
 
         # Output folder
-        ttk.Label(input_frame, text="Output Folder:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(input_frame, text="Output Folder:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.output_folder_var = tk.StringVar(value="output")
         self.output_entry = ttk.Entry(input_frame, textvariable=self.output_folder_var, width=50)
-        self.output_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+        self.output_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
 
         output_browse_btn = ttk.Button(input_frame, text="Browse", command=self.browse_output_folder)
-        output_browse_btn.grid(row=3, column=2, pady=5)
+        output_browse_btn.grid(row=2, column=2, pady=5)
+
+        # Info about 2-bit default
+        info_frame = ttk.Frame(input_frame)
+        info_frame.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(10, 5))
+
+        ttk.Label(info_frame, text="Note:", font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(info_frame, text="2 bits uses fixed adaptive quantizer table",
+                 font=('Arial', 9)).pack(side=tk.LEFT)
 
         # Compress button
         self.compress_btn = ttk.Button(input_frame,
                                       text="Start Compression",
-                                      command=self.start_compression_thread)
+                                      command=self.start_compression)
         self.compress_btn.grid(row=4, column=0, columnspan=3, pady=(20, 0))
 
         self.compress_tab.columnconfigure(0, weight=1)
@@ -561,66 +628,102 @@ class ImageCompressionGUI:
         input_frame.columnconfigure(1, weight=1)
 
     def setup_decompress_tab(self):
-        """Setup decompression tab"""
-        input_frame = ttk.LabelFrame(self.decompress_tab, text="Decompression Input", padding="10")
-        input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
-        input_frame.columnconfigure(1, weight=1)
-
-        # Binary file selection
-        ttk.Label(input_frame, text="Compressed Binary File (.bin):").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.binary_path_var = tk.StringVar()
-        self.binary_entry = ttk.Entry(input_frame, textvariable=self.binary_path_var, width=50)
-        self.binary_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 5))
-
-        browse_bin_btn = ttk.Button(input_frame, text="Browse", command=self.browse_binary_file)
-        browse_bin_btn.grid(row=0, column=2, pady=5)
-
-        # Output folder
-        ttk.Label(input_frame, text="Output Folder:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.decompress_output_var = tk.StringVar(value="output_decompressed")
-        self.decompress_output_entry = ttk.Entry(input_frame, textvariable=self.decompress_output_var, width=50)
-        self.decompress_output_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
-
-        output_browse_btn = ttk.Button(input_frame, text="Browse", command=self.browse_decompress_output_folder)
-        output_browse_btn.grid(row=1, column=2, pady=5)
-
-        # Decompress button
-        self.decompress_btn = ttk.Button(input_frame,
-                                        text="Start Decompression",
-                                        command=self.start_decompression_thread)
-        self.decompress_btn.grid(row=2, column=0, columnspan=3, pady=(20, 0))
+        """Setup decompression tab - with two sections"""
+        # Create a frame with two columns
+        main_frame = ttk.Frame(self.decompress_tab)
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
 
         self.decompress_tab.columnconfigure(0, weight=1)
         self.decompress_tab.rowconfigure(0, weight=1)
-        input_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+
+        # Left side: Decompress from NPZ (Recommended)
+        npz_frame = ttk.LabelFrame(main_frame, text="Decompress from NPZ File (Recommended)", padding="10")
+        npz_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5), pady=5)
+        npz_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(npz_frame, text="NPZ File Path:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.npz_path_var = tk.StringVar()
+        self.npz_entry = ttk.Entry(npz_frame, textvariable=self.npz_path_var, width=40)
+        self.npz_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 5))
+
+        browse_npz_btn = ttk.Button(npz_frame, text="Browse", command=self.browse_npz_file)
+        browse_npz_btn.grid(row=0, column=2, pady=5)
+
+        ttk.Label(npz_frame, text="Output Filename:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.npz_output_var = tk.StringVar(value="decompressed_from_npz.png")
+        self.npz_output_entry = ttk.Entry(npz_frame, textvariable=self.npz_output_var, width=40)
+        self.npz_output_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+
+        self.decompress_npz_btn = ttk.Button(npz_frame,
+                                           text="Decompress from NPZ",
+                                           command=self.start_decompress_npz)
+        self.decompress_npz_btn.grid(row=2, column=0, columnspan=3, pady=(15, 0))
+
+        # Right side: Decompress from Images (Legacy)
+        img_frame = ttk.LabelFrame(main_frame, text="Decompress from Images (Legacy)", padding="10")
+        img_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0), pady=5)
+        img_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(img_frame, text="Predicted Image:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.pred_path_var = tk.StringVar()
+        self.pred_entry = ttk.Entry(img_frame, textvariable=self.pred_path_var, width=40)
+        self.pred_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 5))
+
+        browse_pred_btn = ttk.Button(img_frame, text="Browse", command=lambda: self.browse_file(self.pred_path_var))
+        browse_pred_btn.grid(row=0, column=2, pady=5)
+
+        ttk.Label(img_frame, text="Dequantized Image:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.deq_path_var = tk.StringVar()
+        self.deq_entry = ttk.Entry(img_frame, textvariable=self.deq_path_var, width=40)
+        self.deq_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 5))
+
+        browse_deq_btn = ttk.Button(img_frame, text="Browse", command=lambda: self.browse_file(self.deq_path_var))
+        browse_deq_btn.grid(row=1, column=2, pady=5)
+
+        ttk.Label(img_frame, text="Output Filename:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.img_output_var = tk.StringVar(value="decompressed.png")
+        self.img_output_entry = ttk.Entry(img_frame, textvariable=self.img_output_var, width=40)
+        self.img_output_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+
+        self.decompress_img_btn = ttk.Button(img_frame,
+                                           text="Decompress from Images",
+                                           command=self.start_decompress_images)
+        self.decompress_img_btn.grid(row=3, column=0, columnspan=3, pady=(15, 0))
 
     def setup_images_tab(self):
         """Setup images display tab"""
-        canvas_frame = ttk.Frame(self.images_tab)
-        canvas_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Create a scrollable frame
+        main_frame = ttk.Frame(self.images_tab)
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
 
         self.images_tab.columnconfigure(0, weight=1)
         self.images_tab.rowconfigure(0, weight=1)
-        canvas_frame.columnconfigure(0, weight=1)
-        canvas_frame.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
 
         # Create canvas and scrollbar
-        self.canvas = tk.Canvas(canvas_frame)
-        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
 
-        self.scrollable_frame.bind(
+        scrollable_frame.bind(
             "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-        self.canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
-        # Create image labels
+        main_frame.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+
+        # Create image labels in a 2x3 grid
         image_titles = [
             "1. Original Image",
             "2. Predicted Image",
@@ -631,21 +734,80 @@ class ImageCompressionGUI:
         ]
 
         self.image_labels = []
+        self.image_frames = []  # Store frames for resizing
         for i, title in enumerate(image_titles):
-            frame = ttk.LabelFrame(self.scrollable_frame, text=title, padding="5")
-            frame.grid(row=i//2, column=i%2, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
+            # Create a frame for each image
+            frame = ttk.LabelFrame(scrollable_frame, text=title, padding="10")
 
-            label = ttk.Label(frame, text="No image available", relief=tk.SUNKEN)
-            label.grid(row=0, column=0, padx=5, pady=5)
+            # Calculate row and column (2 columns, 3 rows)
+            row = i // 2
+            col = i % 2
+
+            frame.grid(row=row, column=col, padx=10, pady=10, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+            # Create a label for the image (use tk.Label for better image support)
+            label = tk.Label(frame, text="No image available", bg='white', relief=tk.SUNKEN)
+            label.pack(expand=True, fill='both', padx=5, pady=5)
             self.image_labels.append(label)
+
+            # Configure grid weights
+            scrollable_frame.columnconfigure(col, weight=1, uniform="col")
+            scrollable_frame.rowconfigure(row, weight=1, uniform="row")
 
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(0, weight=1)
 
-        for i in range(2):
-            self.scrollable_frame.columnconfigure(i, weight=1)
-        for i in range(3):
-            self.scrollable_frame.rowconfigure(i, weight=1)
+    def load_and_display_images(self):
+        """Load and display all generated images"""
+        try:
+            # Load images from output folder
+            image_files = [
+                "1_original.png",
+                "2_predicted.png",
+                "3_error.png",
+                "4_quantized.png",
+                "5_dequantized.png",
+                "6_decompressed.png"
+            ]
+
+            for i, filename in enumerate(image_files):
+                filepath = os.path.join("output", filename)
+                if os.path.exists(filepath):
+                    try:
+                        # Open and resize the image
+                        img = Image.open(filepath)
+
+                        # Calculate target size (max 300x300 while maintaining aspect ratio)
+                        max_width, max_height = 300, 300
+                        img_width, img_height = img.size
+
+                        # Calculate scaling factor
+                        width_ratio = max_width / img_width
+                        height_ratio = max_height / img_height
+                        scale = min(width_ratio, height_ratio)
+
+                        # Calculate new size
+                        new_width = int(img_width * scale)
+                        new_height = int(img_height * scale)
+
+                        # Resize image
+                        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+                        # Convert to PhotoImage
+                        photo = ImageTk.PhotoImage(img)
+
+                        # Update label with image
+                        self.image_labels[i].config(image=photo, text="")
+                        self.image_labels[i].image = photo  # Keep reference to prevent garbage collection
+
+                    except Exception as e:
+                        self.image_labels[i].config(image="", text=f"Error loading {filename}\n{str(e)}", bg='white')
+                        self.log_to_console(f"Error loading {filename}: {str(e)}")
+                else:
+                    self.image_labels[i].config(image="", text=f"{filename} not found", bg='white')
+
+        except Exception as e:
+            self.log_to_console(f"Error loading images: {str(e)}")
 
     def setup_results_tab(self):
         """Setup results tab"""
@@ -674,17 +836,17 @@ class ImageCompressionGUI:
         if filename:
             self.image_path_var.set(filename)
 
-    def browse_binary_file(self):
-        """Browse for binary file"""
+    def browse_npz_file(self):
+        """Browse for NPZ file"""
         filename = filedialog.askopenfilename(
-            title="Select Compressed Binary File",
+            title="Select NPZ File",
             filetypes=[
-                ("Binary files", "*.bin"),
+                ("NPZ files", "*.npz"),
                 ("All files", "*.*")
             ]
         )
         if filename:
-            self.binary_path_var.set(filename)
+            self.npz_path_var.set(filename)
 
     def browse_output_folder(self):
         """Browse for output folder"""
@@ -692,22 +854,20 @@ class ImageCompressionGUI:
         if folder:
             self.output_folder_var.set(folder)
 
-    def browse_decompress_output_folder(self):
-        """Browse for decompression output folder"""
-        folder = filedialog.askdirectory(title="Select Output Folder")
-        if folder:
-            self.decompress_output_var.set(folder)
+    def browse_file(self, var):
+        """Browse for any file"""
+        filename = filedialog.askopenfilename(
+            title="Select File",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")]
+        )
+        if filename:
+            var.set(filename)
 
-    def start_compression_thread(self):
-        """Start compression in a separate thread"""
-        if self.is_compressing:
-            messagebox.showwarning("Warning", "Compression is already in progress!")
-            return
-
+    def start_compression(self):
+        """Start compression"""
         # Get inputs
         image_path = self.image_path_var.get()
         bits_str = self.bits_var.get()
-        color_mode = self.color_mode_var.get()
         output_folder = self.output_folder_var.get()
 
         # Validate inputs
@@ -721,8 +881,8 @@ class ImageCompressionGUI:
 
         try:
             num_bits = int(bits_str) if bits_str else 2
-            if num_bits < 1 or num_bits > 8:
-                messagebox.showerror("Error", "Number of bits must be between 1 and 8!")
+            if num_bits <= 0:
+                messagebox.showerror("Error", "Number of bits must be positive!")
                 return
         except ValueError:
             messagebox.showerror("Error", "Number of bits must be an integer!")
@@ -734,415 +894,357 @@ class ImageCompressionGUI:
 
         # Disable button and update status
         self.compress_btn.config(state='disabled')
-        self.is_compressing = True
-        self.update_progress("Starting compression...", 0)
+        self.update_progress(f"Starting compression with {num_bits} bits/channel...", 10)
 
-        # Start compression thread
-        self.compression_thread = threading.Thread(
-            target=self.run_compression,
-            args=(image_path, num_bits, color_mode, output_folder)
-        )
-        self.compression_thread.daemon = True
-        self.compression_thread.start()
-
-    def run_compression(self, image_path, num_bits, color_mode, output_folder):
-        """Run compression in thread using PredictiveCoding2D class"""
         try:
-            # Update progress
-            self.update_progress("Initializing compressor...", 10)
+            # Create PredictiveCoding2D instance with specified bits
+            self.pc = PredictiveCoding2D(num_bits=num_bits)
 
-            # Create compressor instance
-            use_color = (color_mode == "Color")
-            self.compressor = PredictiveCoding2D(num_bits=num_bits, use_color=use_color)
+            # Capture console output
+            original_stdout = sys.stdout
+            sys.stdout = StringIO()
 
             # Run compression
             self.update_progress("Running compression algorithm...", 30)
-            success = self.compressor.compress(image_path)
+            self.pc.compress(image_path)
 
-            if not success:
-                raise Exception("Compression failed")
+            # Get captured output
+            captured_output = sys.stdout.getvalue()
+            sys.stdout = original_stdout
 
-            # Save binary file
-            self.update_progress("Saving compressed binary file...", 70)
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-            binary_file = os.path.join(output_folder, f"{base_name}_compressed.bin")
-            self.compressor.save_binary_file(binary_file)
+            # Display captured output
+            if captured_output:
+                self.log_to_console(captured_output)
 
-            # Save images
-            self.update_progress("Saving visual images...", 90)
-            self.compressor.save_images(output_folder)
-
-            # Complete
+            # Update progress
             self.update_progress("Compression completed!", 100)
 
-            # Calculate compression stats
-            original_size = os.path.getsize(image_path) * 8
-            compressed_size = os.path.getsize(binary_file) * 8
-
-            # Get image data for display
-            images = {
-                'original': self.compressor.original,
-                'predicted': self.compressor.predicted,
-                'error': self.compressor.error,
-                'quantized': self.compressor.quantized,
-                'dequantized': self.compressor.dequantized,
-                'decompressed': self.compressor.decompressed
-            }
-
-            result = {
-                'success': True,
-                'compression_ratio': original_size / compressed_size if compressed_size > 0 else 0,
-                'original_size': original_size,
-                'compressed_size': compressed_size,
-                'images': images,
-                'quantizer_tables': self.compressor.quantizer_tables,
-                'quantization_info': self.compressor.quantizers_info,
-                'num_bits': num_bits,
-                'image_folder': output_folder,
-                'binary_file': binary_file,
-                'color_mode': color_mode
-            }
-
-        except Exception as e:
-            result = {'success': False, 'error': str(e)}
-
-        # Update GUI in main thread
-        self.root.after(0, self.on_compression_complete, result)
-
-    def on_compression_complete(self, result):
-        """Handle compression completion"""
-        self.is_compressing = False
-        self.compress_btn.config(state='normal')
-
-        # Reset progress bar
-        self.progress_var.set(0)
-        self.status_label.config(text="Ready")
-
-        if result['success']:
-            self.last_compression_result = result
-
-            # Update console
-            self.log_to_console(f"✓ Compression completed successfully!")
-            self.log_to_console(f"  Compression Ratio: {result['compression_ratio']:.2f}:1")
-            self.log_to_console(f"  Original Size: {result['original_size']} bits")
-            self.log_to_console(f"  Compressed Size: {result['compressed_size']} bits")
-            self.log_to_console(f"  Images saved to: {result['image_folder']}")
-            self.log_to_console(f"  Binary file: {result['binary_file']}")
-
-            # Update images display
-            self.update_image_display(result['images'])
+            # Load and display images
+            self.load_and_display_images()
 
             # Update results tab
-            self.update_results_tab(result)
+            self.update_results_tab()
 
             # Show success message
             messagebox.showinfo("Success", "Compression completed successfully!")
 
             # Switch to images tab
             self.notebook.select(self.images_tab)
-        else:
-            self.log_to_console(f"✗ Compression failed: {result['error']}")
-            messagebox.showerror("Error", f"Compression failed: {result['error']}")
-
-    def start_decompression_thread(self):
-        """Start decompression in a separate thread"""
-        if self.is_decompressing:
-            messagebox.showwarning("Warning", "Decompression is already in progress!")
-            return
-
-        # Get inputs
-        binary_file = self.binary_path_var.get()
-        output_folder = self.decompress_output_var.get()
-
-        # Validate inputs
-        if not binary_file:
-            messagebox.showerror("Error", "Please select a binary file!")
-            return
-
-        if not os.path.exists(binary_file):
-            messagebox.showerror("Error", f"Binary file not found: {binary_file}")
-            return
-
-        # Create output folder if it doesn't exist
-        if output_folder and not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-
-        # Disable button and update status
-        self.decompress_btn.config(state='disabled')
-        self.is_decompressing = True
-        self.update_progress("Starting decompression...", 0)
-
-        # Start decompression thread
-        self.decompression_thread = threading.Thread(
-            target=self.run_decompression,
-            args=(binary_file, output_folder)
-        )
-        self.decompression_thread.daemon = True
-        self.decompression_thread.start()
-
-    def run_decompression(self, binary_file, output_folder):
-        """Run decompression in thread using PredictiveCodingDecompressor class"""
-        try:
-            self.update_progress("Initializing decompressor...", 10)
-
-            # Create decompressor instance
-            self.decompressor = PredictiveCodingDecompressor()
-
-            # Run decompression
-            self.update_progress("Running decompression algorithm...", 30)
-            success = self.decompressor.decompress(binary_file)
-
-            if not success:
-                raise Exception("Decompression failed")
-
-            # Save decompressed image
-            self.update_progress("Saving decompressed image...", 80)
-            base_name = os.path.splitext(os.path.basename(binary_file))[0]
-            decompressed_path = os.path.join(output_folder, f"{base_name}_decompressed.png")
-            self.decompressor.save_image(decompressed_path)
-
-            # Complete
-            self.update_progress("Decompression completed!", 100)
-
-            # Create images dict for display
-            images = {
-                'decompressed': self.decompressor.decompressed,
-                'quantized': self.decompressor.quantized.astype(float),
-                'original': np.zeros_like(self.decompressor.decompressed),
-                'predicted': np.zeros_like(self.decompressor.decompressed),
-                'error': np.zeros_like(self.decompressor.decompressed),
-                'dequantized': np.zeros_like(self.decompressor.decompressed)
-            }
-
-            result = {
-                'success': True,
-                'images': images,
-                'quantizer_tables': self.decompressor.quantizer_tables,
-                'quantization_info': self.decompressor.quantizers_info,
-                'num_bits': self.decompressor.num_bits,
-                'image_folder': output_folder,
-                'decompressed_file': decompressed_path,
-                'width': self.decompressor.width,
-                'height': self.decompressor.height,
-                'channels': self.decompressor.channels
-            }
 
         except Exception as e:
-            result = {'success': False, 'error': str(e)}
+            # Restore stdout if there's an error
+            sys.stdout = original_stdout if 'original_stdout' in locals() else sys.stdout
+            messagebox.showerror("Error", f"Compression failed: {str(e)}")
+            self.log_to_console(f"✗ Compression failed: {str(e)}")
+        finally:
+            self.compress_btn.config(state='normal')
+            self.progress_var.set(0)
+            self.status_label.config(text="Ready")
 
-        # Update GUI in main thread
-        self.root.after(0, self.on_decompression_complete, result)
+    def start_decompress_npz(self):
+        """Start decompression from NPZ"""
+        if not self.npz_path_var.get():
+            messagebox.showerror("Error", "Please select an NPZ file")
+            return
 
-    def on_decompression_complete(self, result):
-        """Handle decompression completion"""
-        self.is_decompressing = False
-        self.decompress_btn.config(state='normal')
+        self.decompress_npz_btn.config(state='disabled')
+        self.update_progress("Decompressing from NPZ...", 10)
 
-        # Reset progress bar
-        self.progress_var.set(0)
-        self.status_label.config(text="Ready")
+        try:
+            output_name = self.npz_output_var.get()
+            if not output_name.endswith('.png'):
+                output_name += '.png'
 
-        if result['success']:
-            # Update console
-            self.log_to_console(f"✓ Decompression completed successfully!")
-            self.log_to_console(f"  Image dimensions: {result['width']}x{result['height']}, {result['channels']} channel(s)")
-            self.log_to_console(f"  Bits per pixel: {result['num_bits']}")
-            self.log_to_console(f"  Decompressed image saved to: {result['decompressed_file']}")
+            # Create PredictiveCoding2D instance
+            self.pc = PredictiveCoding2D()
 
-            # Update images display
-            self.update_image_display(result['images'])
+            # Capture console output
+            original_stdout = sys.stdout
+            sys.stdout = StringIO()
 
-            # Update results tab
-            self.update_results_tab(result, is_decompression=True)
+            self.update_progress("Running decompression algorithm...", 30)
+            decompressed = self.pc.decompress_single_npz(self.npz_path_var.get(), output_name)
+
+            # Get captured output
+            captured_output = sys.stdout.getvalue()
+            sys.stdout = original_stdout
+
+            # Display captured output
+            if captured_output:
+                self.log_to_console(captured_output)
+
+            if decompressed is None:
+                messagebox.showerror("Decompression Error", "Decompression failed!")
+                self.update_progress("Decompression failed", 0)
+                return
+
+            # Update result
+            self.update_progress("Decompression completed!", 100)
 
             # Show success message
-            messagebox.showinfo("Success", "Decompression completed successfully!")
+            messagebox.showinfo("Success", "Decompression from NPZ completed successfully!")
 
-            # Switch to images tab
-            self.notebook.select(self.images_tab)
-        else:
-            self.log_to_console(f"✗ Decompression failed: {result['error']}")
-            messagebox.showerror("Error", f"Decompression failed: {result['error']}")
+            # Refresh images display
+            self.load_and_display_images()
+
+            # Update results tab
+            self.update_results_tab()
+
+        except Exception as e:
+            # Restore stdout if there's an error
+            sys.stdout = original_stdout if 'original_stdout' in locals() else sys.stdout
+            messagebox.showerror("Error", f"Decompression failed: {str(e)}")
+            self.log_to_console(f"✗ Decompression failed: {str(e)}")
+        finally:
+            self.decompress_npz_btn.config(state='normal')
+            self.progress_var.set(0)
+            self.status_label.config(text="Ready")
+
+    def start_decompress_images(self):
+        """Start decompression from images"""
+        if not self.pred_path_var.get() or not self.deq_path_var.get():
+            messagebox.showerror("Error", "Please select both predicted and dequantized images")
+            return
+
+        self.decompress_img_btn.config(state='disabled')
+        self.update_progress("Decompressing from images...", 10)
+
+        try:
+            output_name = self.img_output_var.get()
+            if not output_name.endswith('.png'):
+                output_name += '.png'
+
+            # Create PredictiveCoding2D instance
+            self.pc = PredictiveCoding2D()
+
+            # Capture console output
+            original_stdout = sys.stdout
+            sys.stdout = StringIO()
+
+            self.update_progress("Running decompression algorithm...", 30)
+            decompressed = self.pc.decompress(
+                self.pred_path_var.get(),
+                self.deq_path_var.get(),
+                output_name
+            )
+
+            # Get captured output
+            captured_output = sys.stdout.getvalue()
+            sys.stdout = original_stdout
+
+            # Display captured output
+            if captured_output:
+                self.log_to_console(captured_output)
+
+            if decompressed is None:
+                messagebox.showerror("Decompression Error", "Decompression failed!")
+                self.update_progress("Decompression failed", 0)
+                return
+
+            # Update result
+            self.update_progress("Decompression completed!", 100)
+
+            # Show success message
+            messagebox.showinfo("Success", "Decompression from images completed successfully!")
+
+            # Refresh images display
+            self.load_and_display_images()
+
+            # Update results tab
+            self.update_results_tab()
+
+        except Exception as e:
+            # Restore stdout if there's an error
+            sys.stdout = original_stdout if 'original_stdout' in locals() else sys.stdout
+            messagebox.showerror("Error", f"Decompression failed: {str(e)}")
+            self.log_to_console(f"✗ Decompression failed: {str(e)}")
+        finally:
+            self.decompress_img_btn.config(state='normal')
+            self.progress_var.set(0)
+            self.status_label.config(text="Ready")
+
+    def load_and_display_images(self):
+        """Load and display all generated images"""
+        try:
+            # Load images from output folder
+            image_files = [
+                "1_original.png",
+                "2_predicted.png",
+                "3_error.png",
+                "4_quantized.png",
+                "5_dequantized.png",
+                "6_decompressed.png"
+            ]
+
+            for i, filename in enumerate(image_files):
+                filepath = os.path.join("output", filename)
+                if os.path.exists(filepath):
+                    try:
+                        img = Image.open(filepath)
+                        # Calculate aspect ratio preserving size
+                        width, height = img.size
+                        max_size = 300
+                        ratio = min(max_size/width, max_size/height)
+                        new_size = (int(width * ratio), int(height * ratio))
+                        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+                        photo = ImageTk.PhotoImage(img)
+                        self.image_labels[i].config(image=photo, text="")
+                        self.image_labels[i].image = photo  # Keep reference
+                    except Exception as e:
+                        self.image_labels[i].config(image="", text=f"Error loading {filename}")
+                        self.log_to_console(f"Error loading {filename}: {str(e)}")
+                else:
+                    self.image_labels[i].config(image="", text=f"{filename} not found")
+
+        except Exception as e:
+            self.log_to_console(f"Error loading images: {str(e)}")
 
     def update_progress(self, message, value=None):
         """Update progress bar and status"""
-        def update():
-            self.status_label.config(text=message)
-            if value is not None:
-                self.progress_var.set(value)
-            self.log_to_console(message)
-
-        self.root.after(0, update)
+        self.status_label.config(text=message)
+        if value is not None:
+            self.progress_var.set(value)
+        self.log_to_console(message)
+        self.root.update_idletasks()
 
     def log_to_console(self, message):
         """Add message to console"""
-        def update():
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.console_text.insert(tk.END, f"[{timestamp}] {message}\n")
-            self.console_text.see(tk.END)
+        self.console_text.insert(tk.END, message)
+        self.console_text.see(tk.END)
+        self.console_text.update_idletasks()
 
-        self.root.after(0, update)
 
-    def update_image_display(self, images):
-        """Update the image display tab with new images"""
-        def update():
-            self.current_images = images
+    def update_results_tab(self):
+        """Update the results tab with compression information"""
+        if self.pc is not None and hasattr(self.pc, 'quantization_params') and self.pc.quantization_params:
+            # Get quantization table text from the pc object
+            quant_text = self.get_quantization_table_text()
 
-            # Display each image
-            image_keys = ['original', 'predicted', 'error', 'quantized', 'dequantized', 'decompressed']
+            # Add compression ratio info
+            if hasattr(self.pc, 'original'):
+                ratio_str, original_size, compressed_size = self.pc.calculate_compression_ratio(self.pc.original)
 
-            for i, key in enumerate(image_keys):
-                if key in images:
-                    img = images[key]
+                results_text = "=" * 80 + "\n"
+                results_text += "COMPRESSION RESULTS\n"
+                results_text += "=" * 80 + "\n\n"
 
-                    # Skip if image is all zeros (not available in decompression)
-                    if np.all(img == 0) and key not in ['quantized', 'decompressed']:
-                        self.image_labels[i].config(image="", text="Not available")
-                        continue
+                results_text += f"BITS PER CHANNEL: {self.pc.num_bits}\n"
+                results_text += f"COMPRESSION RATIO: {ratio_str}\n"
+                results_text += f"ORIGINAL SIZE: {round(original_size / 1024, 2):.2f} KB\n"
+                results_text += f"COMPRESSED SIZE: {round(compressed_size / 1024, 2):.2f} KB\n\n"
 
-                    # Convert to displayable format
-                    if key == 'quantized':
-                        # Scale quantized indices for display
-                        if img.max() > img.min():
-                            display_img = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
-                        else:
-                            display_img = img.astype(np.uint8)
-                    else:
-                        # Normalize other images
-                        img_float = img.astype(float)
-                        if img_float.max() > img_float.min():
-                            display_img = ((img_float - img_float.min()) /
-                                         (img_float.max() - img_float.min()) * 255).astype(np.uint8)
-                        else:
-                            display_img = img_float.astype(np.uint8)
+                results_text += quant_text
 
-                    # Convert to PhotoImage
-                    if len(display_img.shape) == 3 and display_img.shape[2] == 3:
-                        pil_image = Image.fromarray(display_img, 'RGB')
-                    elif len(display_img.shape) == 3 and display_img.shape[2] == 1:
-                        pil_image = Image.fromarray(display_img[:,:,0], 'L')
-                    elif len(display_img.shape) == 2:
-                        pil_image = Image.fromarray(display_img, 'L')
-                    else:
-                        pil_image = Image.fromarray(display_img)
-
-                    # Resize for display
-                    max_size = 300
-                    width, height = pil_image.size
-                    if width > max_size or height > max_size:
-                        ratio = min(max_size/width, max_size/height)
-                        new_size = (int(width * ratio), int(height * ratio))
-                        pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
-
-                    photo = ImageTk.PhotoImage(pil_image)
-
-                    # Update label
-                    self.image_labels[i].config(image=photo, text="")
-                    self.image_labels[i].image = photo
-                else:
-                    self.image_labels[i].config(image="", text="Image not available")
-
-        self.root.after(0, update)
-
-    def update_results_tab(self, result, is_decompression=False):
-        """Update the results tab with compression/decompression info"""
-        def update():
-            text = ""
-
-            if not is_decompression and 'quantization_info' in result:
-                # Compression results
-                text += "=" * 70 + "\n"
-                text += "COMPRESSION RESULTS\n"
-                text += "=" * 70 + "\n\n"
-
-                text += f"Number of Bits: {result['num_bits']}\n"
-                text += f"Color Mode: {result['color_mode']}\n"
-                text += f"Compression Ratio: {result['compression_ratio']:.2f}:1\n"
-                text += f"Original Size: {result['original_size']:,} bits\n"
-                text += f"Compressed Size: {result['compressed_size']:,} bits\n\n"
-
-                text += "QUANTIZATION INFORMATION\n"
-                text += "-" * 70 + "\n\n"
-
-                for i, q_info in enumerate(result['quantization_info']):
-                    text += f"Channel {i+1}:\n"
-                    text += f"  Min Error: {q_info['min']:.2f}\n"
-                    text += f"  Max Error: {q_info['max']:.2f}\n"
-                    text += f"  Range: {q_info['max'] - q_info['min']:.2f}\n"
-                    text += f"  Step Size: {(q_info['max'] - q_info['min']) / (2**result['num_bits']):.2f}\n\n"
-
-                # Add quantizer tables
-                if 'quantizer_tables' in result and result['quantizer_tables']:
-                    text += "\nQUANTIZER TABLES\n"
-                    text += "=" * 70 + "\n\n"
-
-                    for ch_idx, qtable in enumerate(result['quantizer_tables']):
-                        text += f"Channel {ch_idx + 1} Quantizer Table:\n"
-                        text += f"{'Level':<8}{'Lower':<15}{'Upper':<15}{'Dequant':<15}\n"
-                        text += "-" * 60 + "\n"
-
-                        for q in qtable:
-                            text += f"{q['level']:<8}{q['lower']:<15.4f}{q['upper']:<15.4f}{q['dequant']:<15.4f}\n"
-                        text += "\n"
-
-            elif is_decompression:
-                # Decompression results
-                text += "=" * 70 + "\n"
-                text += "DECOMPRESSION RESULTS\n"
-                text += "=" * 70 + "\n\n"
-
-                text += f"Image Dimensions: {result['width']} x {result['height']}\n"
-                text += f"Channels: {result['channels']}\n"
-                text += f"Bits per pixel: {result['num_bits']}\n"
-                text += f"Decompressed file: {result['decompressed_file']}\n\n"
-
-                if 'quantization_info' in result:
-                    text += "QUANTIZATION RANGES (from binary file)\n"
-                    text += "-" * 70 + "\n"
-                    for i, q_info in enumerate(result['quantization_info']):
-                        text += f"Channel {i+1}: Min={q_info['min']:.2f}, Max={q_info['max']:.2f}\n"
-                    text += "\n"
-
-                # Add quantizer tables for decompression too
-                if 'quantizer_tables' in result and result['quantizer_tables']:
-                    text += "\nQUANTIZER TABLES (Reconstructed from binary)\n"
-                    text += "=" * 70 + "\n\n"
-
-                    for ch_idx, qtable in enumerate(result['quantizer_tables']):
-                        text += f"Channel {ch_idx + 1} Quantizer Table:\n"
-                        text += f"{'Level':<8}{'Lower':<15}{'Upper':<15}{'Dequant':<15}\n"
-                        text += "-" * 60 + "\n"
-
-                        for q in qtable:
-                            text += f"{q['level']:<8}{q['lower']:<15.4f}{q['upper']:<15.4f}{q['dequant']:<15.4f}\n"
-                        text += "\n"
-
+                self.results_text.delete(1.0, tk.END)
+                self.results_text.insert(tk.END, results_text)
+        else:
             self.results_text.delete(1.0, tk.END)
-            self.results_text.insert(1.0, text)
+            self.results_text.insert(tk.END,
+                "No compression results available. Run compression first.\n\n"
+                "After compression, this tab will show:\n"
+                "• Quantization tables for each channel\n"
+                "• Compression ratio information\n"
+                "• File sizes\n"
+                "• Output file list")
 
-        self.root.after(0, update)
+    def get_quantization_table_text(self):
+        """Generate quantization table text from pc object"""
+        if not hasattr(self.pc, 'quantization_params') or not self.pc.quantization_params:
+            return "No quantization parameters available."
+
+        text = "\n" + "=" * 80 + "\n"
+        text += "QUANTIZATION TABLES\n"
+        text += "=" * 80 + "\n\n"
+
+        # For each channel
+        for ch_params in self.pc.quantization_params:
+            ch = ch_params['channel']
+            channel_names = ['RED', 'GREEN', 'BLUE']
+
+            text += f"{channel_names[ch]} CHANNEL:\n"
+            text += "-" * 40 + "\n"
+            text += f"Observed Error Min: {ch_params['e_min']:.4f}\n"
+            text += f"Observed Error Max: {ch_params['e_max']:.4f}\n"
+            text += f"Levels: {ch_params['levels']}\n"
+            text += f"Bits: {ch_params['num_bits']}\n\n"
+
+            # Get bins and dequant values
+            bins = ch_params.get('bins', self.pc.Q_BINS)
+            dequant_values = ch_params.get('dequant_values', self.pc.Q_DEQUANT_VALUES)
+            levels = ch_params['levels']
+
+            # Create bin boundaries
+            bin_lowers = np.insert(bins, 0, -np.inf)
+            bin_uppers = np.append(bins, np.inf)
+
+            # Create table header
+            text += f"{'Index':<8} {'Binary':<10} {'Dequant Value':<15} {'Range':<30}\n"
+            text += "-" * 63 + "\n"
+
+            # Add each level
+            for i in range(levels):
+                index = i
+                binary_code = format(i, f'0{self.pc.num_bits}b')
+
+                lower = bin_lowers[i]
+                upper = bin_uppers[i]
+
+                # Format the range string
+                lower_str = f"{lower:.4f}" if lower != -np.inf else "-inf"
+                upper_str = f"{upper:.4f}" if upper != np.inf else "inf"
+                range_str = f"{lower_str}, {upper_str}"
+
+                dequant_value = dequant_values[i] if i < len(dequant_values) else 0
+
+                text += f"{index:<8} {binary_code:<10} {dequant_value:<15.4f} {range_str:<30}\n"
+
+            text += "\n"
+
+        return text
 
 
-# ============================================================================
-# Main Function
-# ============================================================================
-def main():
-    """Main function"""
+# --------------------------
+# CLI Menu (to choose between GUI and CLI)
+# --------------------------
+def run_cli_menu():
+    """CLI menu to choose between GUI and CLI modes"""
+    while True:
+        print("\n" + "=" * 60)
+        print("ADAPTIVE PREDICTIVE CODING SYSTEM")
+        print("Per-Channel Processing")
+        print("=" * 60)
+        print("1. Run GUI Interface")
+        print("2. Run Command Line Interface")
+        print("3. Exit")
+        choice = input("\nEnter choice (1-3): ").strip()
+
+        if choice == "3":
+            print("Exiting...")
+            return
+        elif choice == "1":
+            run_gui()
+            break
+        elif choice == "2":
+            run_command_line()
+            break
+        else:
+            print("Invalid choice! Please enter 1-3.")
+
+def run_gui():
+    """Run the GUI application"""
     root = tk.Tk()
-
-    # Create and run the GUI
     app = ImageCompressionGUI(root)
-
-    # Center window
-    root.update_idletasks()
-    width = root.winfo_width()
-    height = root.winfo_height()
-    x = (root.winfo_screenwidth() // 2) - (width // 2)
-    y = (root.winfo_screenheight() // 2) - (height // 2)
-    root.geometry(f'{width}x{height}+{x}+{y}')
-
     root.mainloop()
 
+def run_command_line():
+    """Run the command line interface"""
+    cli = CLI()
+    cli.run()
 
+
+# --------------------------
+# Modified Main Application Entry Point
+# --------------------------
 if __name__ == "__main__":
-    main()
+    run_cli_menu()

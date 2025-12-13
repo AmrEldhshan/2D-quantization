@@ -53,26 +53,47 @@ class PredictiveCoding2D:
         return self.predicted, self.error
 
     # --------------------------
-    # Uniform quantization
+    # Uniform quantization - SEPARATE PER CHANNEL
     # --------------------------
     def quantize_dequantize(self, error):
         levels = 2 ** self.num_bits
-        e_min, e_max = error.min(), error.max()
-        step = (e_max - e_min) / levels
-        if step == 0:
-            step = 1e-6
+        h, w, c = error.shape
 
-        quantized = np.floor((error - e_min) / step).astype(np.int32)
-        quantized = np.clip(quantized, 0, levels - 1)
-        dequantized = e_min + (quantized + 0.5) * step
+        quantized = np.zeros_like(error, dtype=np.int32)
+        dequantized = np.zeros_like(error, dtype=np.float32)
 
+        # Store quantization parameters for each channel
         self.quantization_params = {
-            'e_min': e_min,
-            'e_max': e_max,
-            'step': step,
+            'e_min': np.zeros(c, dtype=np.float32),
+            'e_max': np.zeros(c, dtype=np.float32),
+            'step': np.zeros(c, dtype=np.float32),
             'levels': levels,
             'num_bits': self.num_bits
         }
+
+        # Process each channel separately
+        for ch in range(c):
+            error_ch = error[:, :, ch]
+            e_min, e_max = error_ch.min(), error_ch.max()
+            step = (e_max - e_min) / levels
+            if step == 0:
+                step = 1e-6
+
+            # Quantize this channel
+            quantized_ch = np.floor((error_ch - e_min) / step).astype(np.int32)
+            quantized_ch = np.clip(quantized_ch, 0, levels - 1)
+
+            # Dequantize this channel
+            dequantized_ch = e_min + (quantized_ch + 0.5) * step
+
+            # Store results
+            quantized[:, :, ch] = quantized_ch
+            dequantized[:, :, ch] = dequantized_ch
+
+            # Store parameters for this channel
+            self.quantization_params['e_min'][ch] = e_min
+            self.quantization_params['e_max'][ch] = e_max
+            self.quantization_params['step'][ch] = step
 
         return quantized, dequantized
 
@@ -89,13 +110,13 @@ class PredictiveCoding2D:
     def save_quantized_image(self, quantized, output_path):
         """Save quantized data as a visualizable image"""
         # Scale quantized values to 0-255 for visualization
-        if quantized.max() > quantized.min():
-            # Normalize to 0-255
-            quantized_img = ((quantized - quantized.min()) /
-                           (quantized.max() - quantized.min()) * 255).astype(np.uint8)
-        else:
-            quantized_img = np.zeros_like(quantized, dtype=np.uint8)
-
+        # Process each channel separately for better visualization
+        quantized_img = np.zeros_like(quantized, dtype=np.uint8)
+        for ch in range(3):
+            quantized_ch = quantized[:, :, ch]
+            if quantized_ch.max() > quantized_ch.min():
+                quantized_img[:, :, ch] = ((quantized_ch - quantized_ch.min()) /
+                                         (quantized_ch.max() - quantized_ch.min()) * 255).astype(np.uint8)
         Image.fromarray(quantized_img).save(output_path)
         print(f"Quantized image saved to: {output_path}")
         return quantized_img
@@ -117,9 +138,9 @@ class PredictiveCoding2D:
         np.savez_compressed(
             output_path,
             quantized_core=quantized_core,  # Core quantized data (no first row/col)
-            e_min=quant_params['e_min'],
-            e_max=quant_params['e_max'],
-            step=quant_params['step'],
+            e_min=quant_params['e_min'],  # Array of 3 values, one per channel
+            e_max=quant_params['e_max'],  # Array of 3 values, one per channel
+            step=quant_params['step'],    # Array of 3 values, one per channel
             levels=quant_params['levels'],
             num_bits=quant_params['num_bits'],
             original_first_row=original_first_row,
@@ -129,6 +150,10 @@ class PredictiveCoding2D:
         print(f"Quantized data (npz) saved to: {output_path}")
         print(f"  - Quantized core shape (no first row/col): {quantized_core.shape}")
         print(f"  - Original first row/col stored separately")
+        print(f"  - Quantization params per channel:")
+        for ch in range(c):
+            print(f"    Channel {ch}: e_min={quant_params['e_min'][ch]:.2f}, "
+                  f"e_max={quant_params['e_max'][ch]:.2f}, step={quant_params['step'][ch]:.2f}")
 
     # --------------------------
     # Load quantized from npz
@@ -138,9 +163,9 @@ class PredictiveCoding2D:
         data = np.load(quantized_path)
 
         quant_params = {
-            'e_min': data['e_min'].item(),
-            'e_max': data['e_max'].item(),
-            'step': data['step'].item(),
+            'e_min': data['e_min'],
+            'e_max': data['e_max'],
+            'step': data['step'],
             'levels': data['levels'].item(),
             'num_bits': data['num_bits'].item(),
             'original_first_row': data['original_first_row'],
@@ -152,13 +177,23 @@ class PredictiveCoding2D:
         return data['quantized_core'], quant_params
 
     # --------------------------
-    # Dequantize
+    # Dequantize - SEPARATE PER CHANNEL
     # --------------------------
     def dequantize(self, quantized, quant_params):
-        """Dequantize using saved parameters"""
-        e_min = quant_params['e_min']
-        step = quant_params['step']
-        dequantized = e_min + (quantized + 0.5) * step
+        """Dequantize using saved parameters - separate per channel"""
+        e_min = quant_params['e_min']  # Array of 3 values
+        step = quant_params['step']    # Array of 3 values
+        c = quantized.shape[2] if len(quantized.shape) > 2 else 1
+
+        if c == 1:
+            # Single channel
+            dequantized = e_min + (quantized + 0.5) * step
+        else:
+            # Multiple channels - process each separately
+            dequantized = np.zeros_like(quantized, dtype=np.float32)
+            for ch in range(c):
+                dequantized[:, :, ch] = e_min[ch] + (quantized[:, :, ch] + 0.5) * step[ch]
+
         return dequantized
 
     # --------------------------
@@ -222,16 +257,17 @@ class PredictiveCoding2D:
         print(f"Image shape: {h}x{w}x{c}")
         print(f"Quantized core shape: {quantized_core.shape}")
 
-        # STEP 1: Dequantize the error core
+        # STEP 1: Dequantize the error core - each channel separately
         dequantized_core = self.dequantize(quantized_core, quant_params)
 
         # Create full dequantized error array with zeros for first row/col
         dequantized_full = np.zeros((h, w, c), dtype=np.float32)
         dequantized_full[1:, 1:, :] = dequantized_core
 
-        print(f"\nDequantized error statistics:")
-        print(f"  Core min: {dequantized_core.min():.2f}, max: {dequantized_core.max():.2f}")
-        print(f"  Full min: {dequantized_full.min():.2f}, max: {dequantized_full.max():.2f}")
+        print(f"\nDequantized error statistics (per channel):")
+        for ch in range(c):
+            print(f"  Channel {ch}: Core min={dequantized_core[:,:,ch].min():.2f}, "
+                  f"max={dequantized_core[:,:,ch].max():.2f}")
 
         # STEP 2: Generate predicted image from first row and first column
         print(f"\nGenerating predicted image from border...")
@@ -239,10 +275,6 @@ class PredictiveCoding2D:
 
         print(f"Predicted image statistics:")
         print(f"  Min: {predicted.min():.2f}, Max: {predicted.max():.2f}")
-        print(f"  Pixel (0,0): {predicted[0, 0, :]}")
-        print(f"  Pixel (0,1): {predicted[0, 1, :]}")
-        print(f"  Pixel (1,0): {predicted[1, 0, :]}")
-        print(f"  Pixel (1,1): {predicted[1, 1, :]}")
 
         # STEP 3: Add predicted + dequantized error
         reconstructed = predicted + dequantized_full
@@ -283,17 +315,16 @@ class PredictiveCoding2D:
             else:
                 return None, "Error: Original image data not found."
 
-        original_bpp = 8.0
-        compressed_bpp = float(num_bits)
+        original_bpp = 8.0 * 3  # 8 bits per channel, 3 channels
+        compressed_bpp = float(num_bits) * 3  # num_bits per channel, 3 channels
 
         compression_ratio = original_bpp / compressed_bpp
 
         # Original File Size
-        original_size_bytes = original_image.size * (original_bpp / 8.0)
+        original_size_bytes = original_image.size * (8.0 / 8.0)  # Already in bytes for 8-bit per channel
 
         # Compressed Data Size
-        # For simplicity based on BPP:
-        compressed_size_bytes = original_image.size * (compressed_bpp / 8.0)
+        compressed_size_bytes = original_image.size * (num_bits / 8.0)  # Convert bits to bytes
 
         ratio_string = f"{round(compression_ratio, 2)}:1"
 
@@ -334,7 +365,7 @@ class PredictiveCoding2D:
         ratio_str, original_size, compressed_size = self.calculate_compression_ratio(original, self.num_bits)
         if ratio_str:
             print("\n" + "=" * 60)
-            print(f"Compression Ratio (8 bits / {self.num_bits} bits): {ratio_str}")
+            print(f"Compression Ratio ({8*3} bits / {self.num_bits*3} bits): {ratio_str}")
             print(f"Original size (estimated): {round(original_size / 1024, 2)} KB")
             print(f"Compressed data size (estimated): {round(compressed_size / 1024, 2)} KB")
             print("=" * 60)
@@ -349,6 +380,7 @@ class PredictiveCoding2D:
         print("5. Quantized (NPZ version):     4_quantized.npz")
         print("   - Core quantized data (no first row/col)")
         print("   - Original first row/col stored separately")
+        print("   - Separate quantization params per channel")
         print("   - Can decompress SOLELY from this file")
         print("6. Dequantized error:           5_dequantized.png")
         print("7. Final decompressed:          6_decompressed.png")
@@ -375,7 +407,7 @@ class PredictiveCoding2D:
         return decompressed
 
     # --------------------------
-    # Print Quantization Table
+    # Print Quantization Table - SEPARATE PER CHANNEL
     # --------------------------
     def print_quantization_table(self):
         if not self.quantization_params:
@@ -388,35 +420,41 @@ class PredictiveCoding2D:
         e_min = params['e_min']
         step = params['step']
 
-        header_width = 110
+        num_channels = len(e_min) if hasattr(e_min, '__len__') else 1
 
-        print("\n" + "=" * header_width)
-        print(f"QUANTIZATION TABLE ({N} BITS, {levels} LEVELS)")
-        print("=" * header_width)
-        print(
-            f"Error Min (e_min): {e_min:.4f} | Error Max (e_max): {params['e_max']:.4f} | Step Size (Range): {step:.4f}")
-        print("-" * header_width)
+        for ch in range(num_channels):
+            e_min_ch = e_min[ch] if hasattr(e_min, '__len__') else e_min
+            step_ch = step[ch] if hasattr(step, '__len__') else step
 
-        # Updated Header: Changed 'Input Error Range [Lower, Upper)'
-        print(
-            f"| {'Index':<7} | {'Binary Code':<15} | {'De-quantized Value':<25} | {'Input Error Range Lower, Upper':<45} |")
-        print("-" * header_width)
+            header_width = 110
 
-        for i in range(levels):
-            index = i
-            binary_code = format(i, f'0{N}b')
+            print("\n" + "=" * header_width)
+            print(f"QUANTIZATION TABLE - CHANNEL {ch} ({N} BITS, {levels} LEVELS)")
+            print("=" * header_width)
+            print(
+                f"Error Min (e_min): {e_min_ch:.4f} | Error Max (e_max): {params['e_max'][ch]:.4f} | Step Size: {step_ch:.4f}")
+            print("-" * header_width)
 
-            lower_bound = e_min + i * step
-            upper_bound = e_min + (i + 1) * step
+            # Updated Header: Changed 'Input Error Range [Lower, Upper)'
+            print(
+                f"| {'Index':<7} | {'Binary Code':<15} | {'De-quantized Value':<25} | {'Input Error Range Lower, Upper':<45} |")
+            print("-" * header_width)
 
-            # Change 1: Updated range string format
-            range_str = f"{lower_bound:.4f}, {upper_bound:.4f}"
+            for i in range(levels):
+                index = i
+                binary_code = format(i, f'0{N}b')
 
-            dequant_value = e_min + (i + 0.5) * step
+                lower_bound = e_min_ch + i * step_ch
+                upper_bound = e_min_ch + (i + 1) * step_ch
 
-            print(f"| {index:<7} | {binary_code:<15} | {dequant_value:.8f}{'':<17} | {range_str:<45} |")
+                # Change 1: Updated range string format
+                range_str = f"{lower_bound:.4f}, {upper_bound:.4f}"
 
-        print("=" * header_width)
+                dequant_value = e_min_ch + (i + 0.5) * step_ch
+
+                print(f"| {index:<7} | {binary_code:<15} | {dequant_value:.8f}{'':<17} | {range_str:<45} |")
+
+            print("=" * header_width)
 
 
 # --------------------------
